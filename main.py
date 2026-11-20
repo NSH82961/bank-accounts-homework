@@ -824,6 +824,513 @@ class Bank:
 
         return False
 
+class Transaction:
+
+    def __init__(
+        self,
+        transaction_type,
+        amount,
+        currency,
+        sender,
+        receiver,
+        fee=0,
+        priority=1,
+        scheduled_at=None,
+        is_external=False
+    ):
+
+        if transaction_type not in ("transfer", "deposit", "withdraw"):
+            raise InvalidOperationError(
+                "Недопустимый тип транзакции"
+            )
+
+        if not isinstance(amount, (int, float)) or isinstance(amount, bool):
+            raise InvalidOperationError(
+                "Сумма транзакции должна быть числом"
+            )
+
+        if not isfinite(amount) or amount <= 0:
+            raise InvalidOperationError(
+                "Сумма транзакции должна быть положительным конечным числом"
+            )
+
+        if currency not in ("USD", "EUR", "RUB", "KZT", "CNY"):
+            raise InvalidOperationError(
+                "Недопустимая валюта транзакции"
+            )
+
+        if not isinstance(fee, (int, float)) or isinstance(fee, bool):
+            raise InvalidOperationError(
+                "Комиссия должна быть числом"
+            )
+
+        if not isfinite(fee) or fee < 0:
+            raise InvalidOperationError(
+                "Комиссия должна быть неотрицательным конечным числом"
+            )
+
+        self.transaction_id = str(uuid4())[:8]
+        self.transaction_type = transaction_type
+        self.amount = amount
+        self.currency = currency
+        self.sender = sender
+        self.receiver = receiver
+        self.fee = fee
+
+        if not isinstance(is_external, bool):
+            raise InvalidOperationError(
+                "Признак внешнего перевода должен быть True или False"
+            )
+
+        self.is_external = is_external
+            
+        if type(priority) is not int or priority not in (1, 2, 3):
+            raise InvalidOperationError(
+                "Приоритет должен быть целым числом от 1 до 3"
+            )
+
+        self.priority = priority
+
+        if scheduled_at is not None and not isinstance(scheduled_at, datetime):
+            raise InvalidOperationError(
+                "Время отложенной операции должно быть datetime"
+            )
+
+        self.scheduled_at = scheduled_at
+    
+        self.status = "pending"
+        self.failure_reason = None
+    
+        self.created_at = datetime.now()
+        self.completed_at = None    
+
+    def complete(self):
+
+        if self.status != "pending":
+            raise InvalidOperationError(
+                "Завершить можно только ожидающую транзакцию"
+            )
+
+        self.status = "completed"
+        self.failure_reason = None
+        self.completed_at = datetime.now()
+
+    def fail(self, reason):
+
+        if self.status != "pending":
+            raise InvalidOperationError(
+                "Отклонить можно только ожидающую транзакцию"
+            )
+
+        if not isinstance(reason, str) or not reason.strip():
+            raise InvalidOperationError(
+                "Необходимо указать причину отказа"
+            )
+
+        self.status = "failed"
+        self.failure_reason = reason
+        self.completed_at = datetime.now()
+
+class TransactionQueue:
+
+    def __init__(self):
+        self.transactions = []
+
+    def add_transaction(self, transaction):
+
+        if not isinstance(transaction, Transaction):
+            raise InvalidOperationError(
+                "В очередь можно добавлять только объекты Transaction"
+            )
+
+        if transaction.status != "pending":
+            raise InvalidOperationError(
+                "В очередь можно добавлять только ожидающие транзакции"
+            )
+
+        self.transactions.append(transaction)
+        self.transactions.sort(
+            key=lambda transaction: transaction.priority,
+            reverse=True
+        )
+
+        print("Транзакция добавлена в очередь:", transaction.transaction_id)
+
+
+    def get_ready_transactions(self):
+
+        ready_transactions = []
+        current_time = datetime.now()
+
+        for transaction in self.transactions:
+
+            if transaction.status != "pending":
+                continue
+
+            if transaction.scheduled_at is None:
+                ready_transactions.append(transaction)
+
+            elif transaction.scheduled_at <= current_time:
+                ready_transactions.append(transaction)
+
+        return ready_transactions
+
+
+    def cancel_transaction(self, transaction_id):
+
+        for transaction in self.transactions:
+
+            if transaction.transaction_id == transaction_id:
+
+                if transaction.status != "pending":
+                    raise InvalidOperationError(
+                        "Отменить можно только ожидающую транзакцию"
+                    )
+
+                transaction.status = "cancelled"
+                transaction.failure_reason = "Отменена пользователем"
+                transaction.completed_at = datetime.now()
+
+                print("Транзакция отменена:", transaction_id)
+
+                return True
+
+        raise InvalidOperationError(
+            "Транзакция не найдена в очереди"
+        )
+
+class TransactionProcessor:
+
+    def __init__(self, bank):
+        self.bank = bank
+        self.processed_transactions = []
+        self.error_log = []
+
+    def get_transaction_count(self):
+        return len(self.processed_transactions)
+
+    def calculate_fee(self, amount, is_external=False):
+
+        if not isinstance(amount, (int, float)) or isinstance(amount, bool):
+            raise InvalidOperationError(
+                "Сумма должна быть числом"
+            )
+
+        if not isfinite(amount) or amount <= 0:
+            raise InvalidOperationError(
+                "Сумма должна быть положительным конечным числом"
+            )
+
+        if is_external:
+            return round(amount * 0.02, 2)
+
+        return 0
+
+    def convert_currency(self, amount, from_currency, to_currency):
+
+        exchange_rates = {
+            "USD": 1,
+            "EUR": 0.92,
+            "RUB": 90,
+            "KZT": 450,
+            "CNY": 7.2
+        }
+
+        if not isinstance(amount, (int, float)) or isinstance(amount, bool):
+            raise InvalidOperationError(
+                "Сумма должна быть числом"
+            )
+
+        if not isfinite(amount) or amount <= 0:
+            raise InvalidOperationError(
+                "Сумма должна быть положительным конечным числом"
+            )
+
+        if from_currency not in exchange_rates:
+            raise InvalidOperationError(
+                "Неизвестная исходная валюта"
+            )
+
+        if to_currency not in exchange_rates:
+            raise InvalidOperationError(
+                "Неизвестная валюта получателя"
+            )
+
+        amount_in_usd = amount / exchange_rates[from_currency]
+
+        converted_amount = amount_in_usd * exchange_rates[to_currency]
+
+        return round(converted_amount, 2)
+
+    def calculate_total_amount(self, amount, is_external=False):
+
+        fee = self.calculate_fee(amount, is_external)
+
+        total_amount = amount + fee
+
+        return total_amount
+
+    def set_transaction_fee(self, transaction, is_external=False):
+
+        if not isinstance(transaction, Transaction):
+            raise InvalidOperationError(
+                "Передан неправильный объект транзакции"
+            )
+
+        if transaction.status != "pending":
+            raise InvalidOperationError(
+                "Изменять комиссию можно только у ожидающей транзакции"
+            )
+
+        fee = self.calculate_fee(
+            transaction.amount,
+            is_external
+        )
+
+        transaction.fee = fee
+
+        return fee
+
+    def record_error(self, transaction, error):
+
+        error_info = {
+            "transaction_id": transaction.transaction_id,
+            "error": str(error),
+            "timestamp": datetime.now()
+        }
+
+        self.error_log.append(error_info)
+
+        if transaction.status == "pending":
+            transaction.fail(str(error))
+
+        if transaction not in self.processed_transactions:
+            self.processed_transactions.append(transaction)
+
+        print("Ошибка транзакции записана:", error)
+
+    def process_safely(self, transaction, current_hour=None):
+
+        try:
+            return self.process_transaction(
+                transaction,
+                current_hour
+            )
+
+        except (
+            InvalidOperationError,
+            InsufficientFundsError,
+            AccountFrozenError,
+            AccountClosedError
+        ) as error:
+
+            if transaction.status == "pending":
+                self.record_error(transaction, error)
+
+            return False
+
+    def process_with_retry(self, transaction, current_hour=None, max_attempts=3):
+
+        if not isinstance(transaction, Transaction):
+            raise InvalidOperationError(
+                "Передан неправильный объект транзакции"
+            )
+
+        if not isinstance(max_attempts, int) or isinstance(max_attempts, bool):
+            raise InvalidOperationError(
+                "Количество попыток должно быть целым числом"
+            )
+
+        if max_attempts < 1:
+            raise InvalidOperationError(
+                "Количество попыток должно быть больше нуля"
+            )
+
+        for attempt in range(1, max_attempts + 1):
+
+            print("Попытка выполнения:", attempt)
+
+            try:
+                return self.process_transaction(
+                    transaction,
+                    current_hour
+                )
+
+            except ConnectionError as error:
+
+                print("Временная ошибка подключения:", error)
+
+                if attempt == max_attempts:
+                    self.record_error(transaction, error)
+                    return False
+
+            except (
+                InvalidOperationError,
+                InsufficientFundsError,
+                AccountFrozenError,
+                AccountClosedError
+            ) as error:
+
+                self.record_error(transaction, error)
+                return False
+
+    def find_account_owner(self, account_number):
+
+        if account_number not in self.bank.accounts:
+            raise InvalidOperationError(
+                "Счёт не найден в банке"
+            )
+
+        for client in self.bank.clients.values():
+
+            if account_number in client.account_numbers:
+                return client
+
+        raise InvalidOperationError(
+            "Владелец банковского счёта не найден"
+        )
+
+    def process_transaction(self, transaction, current_hour=None):
+
+        if not isinstance(transaction, Transaction):
+            raise InvalidOperationError(
+                "Передан неправильный объект транзакции"
+            )
+
+        if transaction.status != "pending":
+            raise InvalidOperationError(
+                "Транзакция уже обработана или отменена"
+            )
+
+        if transaction.transaction_type != "transfer":
+            raise InvalidOperationError(
+                "Пока поддерживаются только переводы"
+            )
+
+        if transaction.scheduled_at is not None:
+            if transaction.scheduled_at > datetime.now():
+                raise InvalidOperationError(
+                    "Время выполнения транзакции ещё не наступило"
+                )
+
+        if transaction.sender not in self.bank.accounts:
+            raise InvalidOperationError("Счёт отправителя не найден")
+
+        if transaction.receiver not in self.bank.accounts:
+            raise InvalidOperationError("Счёт получателя не найден")
+
+        sender_account = self.bank.accounts[transaction.sender]
+        receiver_account = self.bank.accounts[transaction.receiver]
+
+        sender_client = self.find_account_owner(transaction.sender)
+        receiver_client = self.find_account_owner(transaction.receiver)
+
+        if transaction.sender == transaction.receiver:
+            raise InvalidOperationError(
+                "Нельзя переводить деньги на тот же счёт"
+            )
+
+        if sender_account.currency != transaction.currency:
+            raise InvalidOperationError(
+                "Валюта отправителя не совпадает с валютой транзакции"
+            )
+
+        received_amount = transaction.amount
+
+        if receiver_account.currency != transaction.currency:
+            received_amount = self.convert_currency(
+                transaction.amount,
+                transaction.currency,
+                receiver_account.currency
+            )
+
+        
+        if not isinstance(sender_account, (BankAccount, PremiumAccount)):
+            raise InvalidOperationError(
+                "Неподдерживаемый тип счёта отправителя"
+            )
+
+        if type(receiver_account) is not BankAccount:
+            raise InvalidOperationError(
+                "Пока поддерживается перевод только на обычный счёт"
+            )
+
+        if sender_account.status != "active":
+            raise InvalidOperationError(
+                "Счёт отправителя неактивен"
+            )
+
+        if receiver_account.status != "active":
+            raise InvalidOperationError(
+                "Счёт получателя неактивен"
+            )
+
+        if transaction.is_external:
+            transaction.fee = self.calculate_fee(
+                transaction.amount,
+                is_external=True
+            )
+
+        total_amount = transaction.amount + transaction.fee
+
+        if isinstance(sender_account, PremiumAccount):
+
+            premium_total = total_amount + sender_account.transaction_fee
+
+            if total_amount > sender_account.withdrawal_limit:
+                raise InvalidOperationError(
+                    "Превышен лимит снятия премиального счёта"
+                )
+
+            if sender_account._balance - premium_total < -sender_account.overdraft_limit:
+                raise InsufficientFundsError(
+                    "Превышен лимит овердрафта"
+                )
+
+        else:
+
+            if sender_account._balance < total_amount:
+                raise InsufficientFundsError(
+                    "Недостаточно средств для перевода с учётом комиссии"
+                )
+
+        self.bank.check_operation_time(
+            current_hour, sender_client.client_id
+        )
+
+        self.bank.check_operation_time(
+            current_hour, receiver_client.client_id
+        )
+
+        sender_balance_before = sender_account._balance
+        receiver_balance_before = receiver_account._balance
+
+        try:
+            self.bank.withdraw(
+                sender_client.client_id,
+                sender_account.account_number,
+                total_amount,
+                current_hour
+            )
+
+            self.bank.deposit(
+                receiver_client.client_id,
+                receiver_account.account_number,
+                received_amount, 
+                current_hour
+            )
+
+        except Exception:
+            sender_account._balance = sender_balance_before
+            receiver_account._balance = receiver_balance_before
+            raise
+
+        transaction.complete()
+        self.processed_transactions.append(transaction)
+
+        print("Перевод успешно выполнен")
+        return True
+    
 
 if __name__ == "__main__":
 
@@ -1662,3 +2169,887 @@ if __name__ == "__main__":
         bank.search_accounts(client_id="nonexistent")
     except InvalidOperationError as error:
         print("Тест 2. Ошибка:", error)
+
+
+    print("\n--- DAY4: ПЕРВАЯ ТРАНЗАКЦИЯ ---")
+
+    transaction1 = Transaction(
+        transaction_type="transfer",
+        amount=500,
+        currency="USD",
+        sender="ACC001",
+        receiver="ACC002",
+        fee=5
+    )
+
+    print("ID транзакции:", transaction1.transaction_id)
+    print("Тип:", transaction1.transaction_type)
+    print("Сумма:", transaction1.amount)
+    print("Валюта:", transaction1.currency)
+    print("Отправитель:", transaction1.sender)
+    print("Получатель:", transaction1.receiver)
+    print("Комиссия:", transaction1.fee)
+    print("Статус:", transaction1.status)
+    print("Причина отказа:", transaction1.failure_reason)
+
+
+
+    print("Время создания:", transaction1.created_at)
+    print("Время завершения:", transaction1.completed_at)
+
+
+
+    print("\n--- DAY4: УСПЕШНОЕ ЗАВЕРШЕНИЕ ТРАНЗАКЦИИ ---")
+
+    transaction1.complete()
+
+    print("Статус:", transaction1.status)
+    print("Причина отказа:", transaction1.failure_reason)
+    print("Время завершения:", transaction1.completed_at)
+
+
+    print("\n--- DAY4: ОТКЛОНЕНИЕ ТРАНЗАКЦИИ ---")
+
+    transaction2 = Transaction(
+        transaction_type="transfer",
+        amount=1000,
+        currency="USD",
+        sender="ACC003",
+        receiver="ACC004"
+    )
+
+    print("Статус до обработки:", transaction2.status)
+
+    transaction2.fail("Недостаточно средств")
+
+    print("Статус после обработки:", transaction2.status)
+    print("Причина отказа:", transaction2.failure_reason)
+    print("Время завершения:", transaction2.completed_at)
+
+
+
+    print("\n--- DAY4: СОЗДАНИЕ ОЧЕРЕДИ ТРАНЗАКЦИЙ ---")
+
+    queue = TransactionQueue()
+
+    transaction3 = Transaction(
+        transaction_type="transfer",
+        amount=200,
+        currency="USD",
+        sender="ACC005",
+        receiver="ACC006"
+    )
+
+    transaction4 = Transaction(
+        transaction_type="transfer",
+        amount=300,
+        currency="USD",
+        sender="ACC007",
+        receiver="ACC008"
+    )
+
+    queue.add_transaction(transaction3)
+    queue.add_transaction(transaction4)
+
+    print("Количество транзакций в очереди:", len(queue.transactions))
+
+    for transaction in queue.transactions:
+        print(
+            "ID:", transaction.transaction_id,
+            "| Сумма:", transaction.amount,
+            "| Статус:", transaction.status
+        )
+
+
+    print("\n--- DAY4: ПРОВЕРКА ПРИОРИТЕТОВ ---")
+
+    priority_queue = TransactionQueue()
+
+    normal = Transaction(
+        "transfer", 200, "USD", "ACC001", "ACC002",
+        priority=1
+    )
+
+    urgent = Transaction(
+        "transfer", 500, "USD", "ACC003", "ACC004",
+        priority=3
+    )
+
+    medium = Transaction(
+        "transfer", 300, "USD", "ACC005", "ACC006",
+        priority=2
+    )
+
+    priority_queue.add_transaction(normal)
+    priority_queue.add_transaction(urgent)
+    priority_queue.add_transaction(medium)
+
+    for transaction in priority_queue.transactions:
+        print(
+            "Сумма:", transaction.amount,
+            "| Приоритет:", transaction.priority
+        )
+
+
+
+    print("\n--- DAY4: ОТЛОЖЕННЫЕ ТРАНЗАКЦИИ ---")
+
+    delayed_queue = TransactionQueue()
+
+    immediate = Transaction(
+        "transfer", 100, "USD", "ACC001", "ACC002",
+        priority=1
+    )
+
+    delayed = Transaction(
+        "transfer", 500, "USD", "ACC003", "ACC004",
+        priority=3,
+        scheduled_at=datetime(2026, 12, 1, 10, 0)
+    )
+
+    delayed_queue.add_transaction(immediate)
+    delayed_queue.add_transaction(delayed)
+
+    print("Всего транзакций:", len(delayed_queue.transactions))
+
+    ready = delayed_queue.get_ready_transactions()
+
+    print("Готовы к выполнению:", len(ready))
+
+    for transaction in ready:
+        print(
+            "Сумма:", transaction.amount,
+            "| Приоритет:", transaction.priority,
+            "| Запланирована:", transaction.scheduled_at
+        )
+
+
+
+    print("\n--- DAY4: ОТМЕНА ТРАНЗАКЦИИ ---")
+
+    print("Статус до отмены:", delayed.status)
+
+    delayed_queue.cancel_transaction(delayed.transaction_id)
+
+    print("Статус после отмены:", delayed.status)
+    print("Причина:", delayed.failure_reason)
+    print("Время отмены:", delayed.completed_at)
+
+    ready = delayed_queue.get_ready_transactions()
+
+    print("Всего транзакций в очереди:", len(delayed_queue.transactions))
+    print("Готовы к выполнению:", len(ready))
+
+
+
+
+    print("\n--- DAY4: СОЗДАНИЕ ПРОЦЕССОРА ---")
+
+    processor = TransactionProcessor(bank)
+
+    print("Банк:", processor.bank.name)
+    print("Обработано транзакций:", processor.get_transaction_count())
+    print("Ошибок:", len(processor.error_log))
+
+
+    print("\n--- DAY4: ПОИСК ВЛАДЕЛЬЦА СЧЁТА ---")
+
+    owner = processor.find_account_owner(
+        alex_savings.account_number
+    )
+
+    print("Номер счёта:", alex_savings.account_number)
+    print("Владелец:", owner.full_name)
+    print("ID клиента:", owner.client_id)
+
+
+
+    print("\n--- DAY4: ПРОВЕРКА ДАННЫХ ТРАНЗАКЦИИ ---")
+
+    test_amounts = [-100, 0, "500", 500]
+
+    for amount in test_amounts:
+        try:
+            transaction = Transaction(
+                "transfer",
+                amount,
+                "USD",
+                "ACC001",
+                "ACC002"
+            )
+
+            print("Сумма:", amount, "— транзакция создана")
+
+        except InvalidOperationError as error:
+            print("Сумма:", amount, "— ошибка:", error)
+
+
+    
+    print("\n--- DAY4: ПОДГОТОВКА БАНКОВСКОГО ПЕРЕВОДА ---")
+
+    transfer_client1 = Client(
+        "Transfer Sender",
+        30,
+        "+1234567001",
+        "sender@example.com",
+        "password123"
+    )
+
+    transfer_client2 = Client(
+        "Transfer Receiver",
+        28,
+        "+1234567002",
+        "receiver@example.com",
+        "password456"
+    )
+
+    bank.add_client(transfer_client1)
+    bank.add_client(transfer_client2)
+
+    transfer_account1 = BankAccount(
+        owner=transfer_client1.full_name,
+        balance=1000,
+        currency="USD"
+    )
+
+    transfer_account2 = BankAccount(
+        owner=transfer_client2.full_name,
+        balance=200,
+        currency="USD"
+    )
+
+    bank.open_account(transfer_client1.client_id, transfer_account1)
+    bank.open_account(transfer_client2.client_id, transfer_account2)
+
+    print("Отправитель:", transfer_account1)
+    print("Получатель:", transfer_account2)
+
+
+
+    print("\n--- DAY4: ПЕРВЫЙ БАНКОВСКИЙ ПЕРЕВОД ---")
+
+    first_transfer = Transaction(
+        transaction_type="transfer",
+        amount=300,
+        currency="USD",
+        sender=transfer_account1.account_number,
+        receiver=transfer_account2.account_number
+    )
+
+    print("Баланс отправителя до:", transfer_account1._balance)
+    print("Баланс получателя до:", transfer_account2._balance)
+
+    processor.process_transaction(
+        first_transfer,
+        current_hour=12
+    )
+
+    print("Баланс отправителя после:", transfer_account1._balance)
+    print("Баланс получателя после:", transfer_account2._balance)
+    print("Статус транзакции:", first_transfer.status)
+    print("Обработано транзакций:", processor.get_transaction_count())
+
+
+
+    print("\n--- DAY4: ПРОВЕРКА ЖУРНАЛА ОШИБОК ---")
+
+    failed_transfer = Transaction(
+        transaction_type="transfer",
+        amount=2000,
+        currency="USD",
+        sender=transfer_account1.account_number,
+        receiver=transfer_account2.account_number
+    )
+
+    try:
+        processor.process_transaction(
+            failed_transfer,
+            current_hour=12
+        )
+
+    except InsufficientFundsError as error:
+        processor.record_error(failed_transfer, error)
+
+    print("Статус транзакции:", failed_transfer.status)
+    print("Причина отказа:", failed_transfer.failure_reason)
+    print("Количество ошибок:", len(processor.error_log))
+    print("Обработано транзакций:", processor.get_transaction_count())
+    print("Баланс отправителя:", transfer_account1._balance)
+    print("Баланс получателя:", transfer_account2._balance)
+
+
+
+    print("\n--- DAY4: АВТОМАТИЧЕСКАЯ ОБРАБОТКА ОШИБОК ---")
+
+    automatic_failed_transfer = Transaction(
+        transaction_type="transfer",
+        amount=3000,
+        currency="USD",
+        sender=transfer_account1.account_number,
+        receiver=transfer_account2.account_number
+    )
+
+    result = processor.process_safely(
+        automatic_failed_transfer,
+        current_hour=12
+    )
+
+    print("Результат перевода:", result)
+    print("Статус:", automatic_failed_transfer.status)
+    print("Причина отказа:", automatic_failed_transfer.failure_reason)
+    print("Количество ошибок:", len(processor.error_log))
+    print("Обработано транзакций:", processor.get_transaction_count())
+    print("Баланс отправителя:", transfer_account1._balance)
+    print("Баланс получателя:", transfer_account2._balance)
+
+
+
+    print("\n--- DAY4: РАСЧЁТ КОМИССИЙ ---")
+
+    amounts = [100, 300, 500, 1000]
+
+    for amount in amounts:
+
+        internal_fee = processor.calculate_fee(
+            amount,
+            is_external=False
+        )
+
+        external_fee = processor.calculate_fee(
+            amount,
+            is_external=True
+        )
+
+        print(
+            "Сумма:", amount,
+            "| Внутренняя комиссия:", internal_fee,
+            "| Внешняя комиссия:", external_fee
+        )
+
+
+
+    print("\n--- DAY4: ОБЩАЯ СУММА СПИСАНИЯ ---")
+
+    amount = 300
+
+    internal_total = processor.calculate_total_amount(
+        amount,
+        is_external=False
+    )
+
+    external_total = processor.calculate_total_amount(
+        amount,
+        is_external=True
+    )
+
+    print("Сумма перевода:", amount)
+    print("Внутренний перевод — всего списать:", internal_total)
+    print("Внешний перевод — всего списать:", external_total)
+
+
+
+    print("\n--- DAY4: СОХРАНЕНИЕ КОМИССИИ ---")
+
+    fee_test_transaction = Transaction(
+        transaction_type="transfer",
+        amount=300,
+        currency="USD",
+        sender=transfer_account1.account_number,
+        receiver=transfer_account2.account_number
+    )
+
+    print("Комиссия до расчёта:", fee_test_transaction.fee)
+
+    processor.set_transaction_fee(
+        fee_test_transaction,
+        is_external=True
+    )
+
+    print("Комиссия после расчёта:", fee_test_transaction.fee)
+    print("Сумма перевода:", fee_test_transaction.amount)
+    print(
+        "Всего к списанию:",
+        fee_test_transaction.amount + fee_test_transaction.fee
+    )
+
+
+    print("\n--- DAY4: ПЕРЕВОД С КОМИССИЕЙ ---")
+
+    print("Баланс отправителя до:", transfer_account1._balance)
+    print("Баланс получателя до:", transfer_account2._balance)
+
+    fee_transfer = Transaction(
+        transaction_type="transfer",
+        amount=300,
+        currency="USD",
+        sender=transfer_account1.account_number,
+        receiver=transfer_account2.account_number
+    )
+
+    processor.set_transaction_fee(
+        fee_transfer,
+        is_external=True
+    )
+
+    processor.process_transaction(
+        fee_transfer,
+        current_hour=12
+    )
+
+    print("Сумма перевода:", fee_transfer.amount)
+    print("Комиссия:", fee_transfer.fee)
+    print("Статус:", fee_transfer.status)
+    print("Баланс отправителя после:", transfer_account1._balance)
+    print("Баланс получателя после:", transfer_account2._balance)
+
+
+
+    print("\n--- DAY4: КОНВЕРТАЦИЯ ВАЛЮТ ---")
+
+    usd_to_eur = processor.convert_currency(100, "USD", "EUR")
+    eur_to_usd = processor.convert_currency(100, "EUR", "USD")
+    usd_to_kzt = processor.convert_currency(100, "USD", "KZT")
+    kzt_to_cny = processor.convert_currency(4500, "KZT", "CNY")
+
+    print("100 USD =", usd_to_eur, "EUR")
+    print("100 EUR =", eur_to_usd, "USD")
+    print("100 USD =", usd_to_kzt, "KZT")
+    print("4500 KZT =", kzt_to_cny, "CNY")
+
+
+
+    print("\n--- DAY4: ПЕРЕВОД USD В EUR ---")
+
+    euro_account = BankAccount(
+        owner=transfer_client2.full_name,
+        balance=100,
+        currency="EUR"
+    )
+
+    bank.open_account(
+        transfer_client2.client_id,
+        euro_account
+    )
+
+    currency_transfer = Transaction(
+        transaction_type="transfer",
+        amount=100,
+        currency="USD",
+        sender=transfer_account1.account_number,
+        receiver=euro_account.account_number
+    )
+
+    print("Баланс отправителя до:", transfer_account1._balance, "USD")
+    print("Баланс получателя до:", euro_account._balance, "EUR")
+
+    processor.process_transaction(
+        currency_transfer,
+        current_hour=12
+    )
+
+    print("Баланс отправителя после:", transfer_account1._balance, "USD")
+    print("Баланс получателя после:", euro_account._balance, "EUR")
+    print("Статус:", currency_transfer.status)
+
+
+    print("\n--- DAY4: ПОДГОТОВКА PREMIUMACCOUNT ---")
+
+    premium_account = PremiumAccount(
+        owner=transfer_client1.full_name,
+        balance=100,
+        currency="USD",
+        overdraft_limit=500,
+        withdrawal_limit=1000,
+        transaction_fee=5
+    )
+
+    bank.open_account(
+        transfer_client1.client_id,
+        premium_account
+    )
+
+    print("Владелец:", premium_account.owner)
+    print("Начальный баланс:", premium_account._balance)
+    print("Лимит овердрафта:", premium_account.overdraft_limit)
+    print("Лимит снятия:", premium_account.withdrawal_limit)
+    print("Комиссия за операцию:", premium_account.transaction_fee)
+    print("Статус:", premium_account.status)
+
+
+
+
+    print("\n--- DAY4: ПЕРЕВОД С PREMIUMACCOUNT ---")
+
+    premium_transfer = Transaction(
+        transaction_type="transfer",
+        amount=300,
+        currency="USD",
+        sender=premium_account.account_number,
+        receiver=transfer_account2.account_number
+    )
+
+    print("Баланс PremiumAccount до:", premium_account._balance)
+    print("Баланс получателя до:", transfer_account2._balance)
+
+    processor.process_transaction(
+        premium_transfer,
+        current_hour=12
+    )
+
+    print("Баланс PremiumAccount после:", premium_account._balance)
+    print("Баланс получателя после:", transfer_account2._balance)
+    print("Статус:", premium_transfer.status)
+
+
+
+    print("\n--- DAY4: ПРОВЕРКА ЛИМИТА ОВЕРДРАФТА ---")
+
+    overdraft_transfer = Transaction(
+        transaction_type="transfer",
+        amount=400,
+        currency="USD",
+        sender=premium_account.account_number,
+        receiver=transfer_account2.account_number
+    )
+
+    print("Баланс PremiumAccount до:", premium_account._balance)
+    print("Баланс получателя до:", transfer_account2._balance)
+
+    result = processor.process_safely(
+        overdraft_transfer,
+        current_hour=12
+    )
+
+    print("Результат перевода:", result)
+    print("Статус транзакции:", overdraft_transfer.status)
+    print("Причина отказа:", overdraft_transfer.failure_reason)
+    print("Баланс PremiumAccount после:", premium_account._balance)
+    print("Баланс получателя после:", transfer_account2._balance)
+
+
+
+    print("\n--- DAY4: ПРОВЕРКА ПОВТОРНЫХ ПОПЫТОК ---")
+
+    retry_transaction = Transaction(
+        transaction_type="transfer",
+        amount=5000,
+        currency="USD",
+        sender=transfer_account1.account_number,
+        receiver=transfer_account2.account_number
+    )
+
+    result = processor.process_with_retry(
+        retry_transaction,
+        current_hour=12,
+        max_attempts=3
+    )
+
+    print("Результат:", result)
+    print("Статус:", retry_transaction.status)
+    print("Причина отказа:", retry_transaction.failure_reason)
+
+
+
+    print("\n--- DAY4: ВРЕМЕННАЯ ОШИБКА ПОДКЛЮЧЕНИЯ ---")
+
+    connection_transaction = Transaction(
+        transaction_type="transfer",
+        amount=50,
+        currency="USD",
+        sender=transfer_account1.account_number,
+        receiver=transfer_account2.account_number
+    )
+
+    original_process = processor.process_transaction
+
+    attempts = [0]
+
+    def simulate_connection_error(transaction, current_hour=None):
+
+        attempts[0] += 1
+
+        if attempts[0] < 3:
+            raise ConnectionError(
+                "Временная недоступность банковского сервиса"
+            )
+
+        return original_process(transaction, current_hour)
+
+    processor.process_transaction = simulate_connection_error
+
+    try:
+        result = processor.process_with_retry(
+            connection_transaction,
+            current_hour=12,
+            max_attempts=3
+        )
+    finally:
+        processor.process_transaction = original_process
+
+    print("Результат:", result)
+    print("Количество попыток:", attempts[0])
+    print("Статус:", connection_transaction.status)
+    print("Баланс отправителя:", transfer_account1._balance)
+    print("Баланс получателя:", transfer_account2._balance)
+
+
+
+    print("\n--- DAY4: ОЧЕРЕДЬ ИЗ 10 ТРАНЗАКЦИЙ ---")
+
+    test_queue = TransactionQueue()
+
+    for i in range(10):
+
+        transaction = Transaction(
+            transaction_type="transfer",
+            amount=10 * (i + 1),
+            currency="USD",
+            sender=transfer_account1.account_number,
+            receiver=transfer_account2.account_number,
+            priority=(i % 3) + 1
+        )
+
+        test_queue.add_transaction(transaction)
+
+    print("Всего транзакций:", len(test_queue.transactions))
+
+    print("\nТранзакции в очереди:")
+
+    for transaction in test_queue.transactions:
+        print(
+            "ID:", transaction.transaction_id,
+            "| Сумма:", transaction.amount,
+            "| Приоритет:", transaction.priority,
+            "| Статус:", transaction.status
+        )
+
+
+
+    print("\n--- DAY4: ГОТОВЫЕ ТРАНЗАКЦИИ ---")
+
+    ready_transactions = test_queue.get_ready_transactions()
+
+    print("Готовы к выполнению:", len(ready_transactions))
+
+    for transaction in ready_transactions:
+        print(
+            "Сумма:", transaction.amount,
+            "| Приоритет:", transaction.priority,
+            "| Статус:", transaction.status
+        )
+
+
+    print("\n--- DAY4: ОБРАБОТКА ОЧЕРЕДИ ИЗ 10 ТРАНЗАКЦИЙ ---")
+
+    print("Баланс отправителя до:", transfer_account1._balance)
+    print("Баланс получателя до:", transfer_account2._balance)
+
+    successful = 0
+    failed = 0
+
+    for transaction in ready_transactions:
+
+        print("\nОбрабатываем транзакцию:", transaction.transaction_id)
+        print("Сумма:", transaction.amount)
+        print("Приоритет:", transaction.priority)
+
+        result = processor.process_safely(
+            transaction,
+            current_hour=12
+        )
+
+        if result:
+            successful += 1
+        else:
+            failed += 1
+
+    print("\n--- РЕЗУЛЬТАТЫ ОБРАБОТКИ ОЧЕРЕДИ ---")
+
+    print("Успешных транзакций:", successful)
+    print("Отклонённых транзакций:", failed)
+
+    print("Баланс отправителя после:", transfer_account1._balance)
+    print("Баланс получателя после:", transfer_account2._balance)
+
+    print("\nСтатусы транзакций:")
+
+    for transaction in test_queue.transactions:
+        print(
+            "Сумма:", transaction.amount,
+            "| Приоритет:", transaction.priority,
+            "| Статус:", transaction.status
+        )
+
+
+    print("\n--- DAY4: ПРОВЕРКА ОТЛОЖЕННОЙ ТРАНЗАКЦИИ ---")
+
+    from datetime import timedelta
+
+    delayed_queue = TransactionQueue()
+
+    delayed_transaction = Transaction(
+        transaction_type="transfer",
+        amount=20,
+        currency="USD",
+        sender=transfer_account1.account_number,
+        receiver=transfer_account2.account_number,
+        priority=3,
+        scheduled_at=datetime.now() + timedelta(days=1)
+    )
+
+    delayed_queue.add_transaction(delayed_transaction)
+
+    print("Всего транзакций:", len(delayed_queue.transactions))
+    print("Запланирована на:", delayed_transaction.scheduled_at)
+
+    ready = delayed_queue.get_ready_transactions()
+
+    print("Готовы к выполнению:", len(ready))
+    print("Статус транзакции:", delayed_transaction.status)
+
+
+    print("\n--- DAY4: ПРОВЕРКА НАСТУПЛЕНИЯ ВРЕМЕНИ ---")
+
+    past_transaction = Transaction(
+        transaction_type="transfer",
+        amount=15,
+        currency="USD",
+        sender=transfer_account1.account_number,
+        receiver=transfer_account2.account_number,
+        priority=2,
+        scheduled_at=datetime.now() - timedelta(days=1)
+    )
+
+    delayed_queue.add_transaction(past_transaction)
+
+    ready = delayed_queue.get_ready_transactions()
+
+    print("Всего транзакций:", len(delayed_queue.transactions))
+    print("Готовы к выполнению:", len(ready))
+
+    for transaction in ready:
+        print(
+            "Сумма:", transaction.amount,
+            "| Приоритет:", transaction.priority,
+            "| Статус:", transaction.status
+        )
+
+
+    print("\n--- DAY4: ВЫПОЛНЕНИЕ ОТЛОЖЕННОЙ ТРАНЗАКЦИИ ---")
+
+    print("Баланс отправителя до:", transfer_account1._balance)
+    print("Баланс получателя до:", transfer_account2._balance)
+
+    for transaction in ready:
+
+        result = processor.process_safely(
+            transaction,
+            current_hour=12
+        )
+
+        print("Результат выполнения:", result)
+        print("Статус транзакции:", transaction.status)
+
+    print("Баланс отправителя после:", transfer_account1._balance)
+    print("Баланс получателя после:", transfer_account2._balance)
+
+
+    print("\n--- DAY4: АВТОМАТИЧЕСКАЯ КОМИССИЯ ---")
+
+    auto_fee_transaction = Transaction(
+        transaction_type="transfer",
+        amount=10,
+        currency="USD",
+        sender=transfer_account1.account_number,
+        receiver=transfer_account2.account_number,
+        is_external=True
+    )
+
+    print("Комиссия до обработки:", auto_fee_transaction.fee)
+
+    result = processor.process_safely(
+        auto_fee_transaction,
+        current_hour=12
+    )
+
+    print("Результат:", result)
+    print("Комиссия после обработки:", auto_fee_transaction.fee)
+    print("Статус:", auto_fee_transaction.status)
+    print("Баланс отправителя:", transfer_account1._balance)
+    print("Баланс получателя:", transfer_account2._balance)
+
+
+
+    print("\n--- DAY4: ПРОВЕРКА ЗАМОРОЖЕННЫХ СЧЕТОВ ---")
+
+    frozen_sender = BankAccount(
+        owner=transfer_client1.full_name,
+        balance=500,
+        currency="USD",
+        status="frozen"
+    )
+
+    frozen_receiver = BankAccount(
+        owner=transfer_client2.full_name,
+        balance=200,
+        currency="USD",
+        status="frozen"
+    )
+
+    # Регистрируем счета в банке как активные,
+    # затем замораживаем их через Bank
+    frozen_sender.status = "active"
+    frozen_receiver.status = "active"
+
+    bank.open_account(transfer_client1.client_id, frozen_sender)
+    bank.open_account(transfer_client2.client_id, frozen_receiver)
+
+    frozen_sender.status = "frozen"
+    frozen_receiver.status = "frozen"
+
+    print("\nТест 1: заморожен отправитель")
+
+    test_frozen_sender = Transaction(
+        transaction_type="transfer",
+        amount=100,
+        currency="USD",
+        sender=frozen_sender.account_number,
+        receiver=transfer_account2.account_number
+    )
+
+    result1 = processor.process_safely(
+        test_frozen_sender,
+        current_hour=12
+    )
+
+    print("Результат:", result1)
+    print("Статус:", test_frozen_sender.status)
+    print("Баланс отправителя:", frozen_sender._balance)
+
+    print("\nТест 2: заморожен получатель")
+
+    test_frozen_receiver = Transaction(
+        transaction_type="transfer",
+        amount=100,
+        currency="USD",
+        sender=transfer_account1.account_number,
+        receiver=frozen_receiver.account_number
+    )
+
+    result2 = processor.process_safely(
+        test_frozen_receiver,
+        current_hour=12
+    )
+
+    print("Результат:", result2)
+    print("Статус:", test_frozen_receiver.status)
+    print("Баланс получателя:", frozen_receiver._balance)
+
+
+
+    print("\n--- DAY4: ПРОВЕРКА СОХРАННОСТИ БАЛАНСОВ ---")
+
+    print("Замороженный отправитель:", frozen_sender._balance)
+    print("Замороженный получатель:", frozen_receiver._balance)
+    print("Обычный счёт отправителя:", transfer_account1._balance)
+    print("Обычный счёт получателя:", transfer_account2._balance)
