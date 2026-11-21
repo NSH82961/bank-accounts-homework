@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from uuid import uuid4
-from math import isfinite 
+from math import isfinite
 from datetime import datetime
 
 
@@ -62,6 +62,13 @@ class AbstractAccount(ABC):
         self.status = status
         self.currency = currency
 
+        # Банк, в котором зарегистрирован счёт
+        # Пока счёт не зарегистрирован, значение None
+        self._bank = None
+
+        # Разрешена ли сейчас финансовая операция банком
+        self._operation_authorized = False
+
         AbstractAccount.used_account_numbers.add(account_number)
 
     @abstractmethod
@@ -79,6 +86,11 @@ class AbstractAccount(ABC):
 class BankAccount(AbstractAccount):
 
     def deposit(self, amount):
+        if self._bank is not None and not self._operation_authorized:
+            raise InvalidOperationError(
+                "Пополнение должно выполняться через банк"
+            )
+
         if self.status == "frozen":
             raise AccountFrozenError("Счёт заморожен. Операция запрещена")
 
@@ -98,6 +110,11 @@ class BankAccount(AbstractAccount):
         print("Счёт пополнен на", amount)
 
     def withdraw(self, amount):
+        if self._bank is not None and not self._operation_authorized:
+            raise InvalidOperationError(
+                "Снятие должно выполняться через банк"
+    )
+
         if self.status == "frozen":
             raise AccountFrozenError("Счёт заморожен. Операция запрещена")
 
@@ -143,7 +160,7 @@ class SavingsAccount(BankAccount):
                  status="active", currency="USD",
                  min_balance=0, monthly_interest_rate=0.01):
 
-       
+
         if not isinstance(min_balance, (int, float)) or isinstance(min_balance, bool):
             raise InvalidOperationError("Минимальный остаток должен быть числом")
 
@@ -185,7 +202,7 @@ class SavingsAccount(BankAccount):
                 "Нельзя снять деньги: будет нарушен минимальный остаток"
             )
 
-        super().withdraw(amount)    
+        super().withdraw(amount)
 
     def apply_monthly_interest(self):
 
@@ -254,9 +271,14 @@ class PremiumAccount(BankAccount):
 
         self.overdraft_limit = overdraft_limit
         self.withdrawal_limit = withdrawal_limit
-        self.transaction_fee = transaction_fee 
+        self.transaction_fee = transaction_fee
 
     def withdraw(self, amount):
+
+        if self._bank is not None and not self._operation_authorized:
+            raise InvalidOperationError(
+                "Снятие с премиального счёта должно выполняться через банк"
+            )
 
         if self.status == "frozen":
             raise AccountFrozenError("Счёт заморожен")
@@ -327,6 +349,11 @@ class InvestmentAccount(BankAccount):
         }
 
     def invest(self, asset_type, amount):
+
+        if self._bank is not None and not self._operation_authorized:
+            raise InvalidOperationError(
+                "Инвестирование должно выполняться через банк"
+            )
 
         if self.status == "frozen":
             raise AccountFrozenError("Счёт заморожен")
@@ -526,9 +553,17 @@ class Bank:
                 "Счёт уже зарегистрирован в банке"
             )
 
+        if account._bank is not None:
+            raise InvalidOperationError(
+                "Счёт уже зарегистрирован в другом банке"
+            )
+
         self.accounts[account.account_number] = account
 
         client.account_numbers.append(account.account_number)
+
+        # Связываем банковский счёт с банком
+        account._bank = self
 
         print("Счёт открыт для клиента:", client.full_name)
 
@@ -667,7 +702,11 @@ class Bank:
 
         account = self.accounts[account_number]
 
-        account.withdraw(amount)
+        try:
+            account._operation_authorized = True
+            account.withdraw(amount)
+        finally:
+            account._operation_authorized = False
 
         print("Банк успешно выполнил снятие денег")
 
@@ -691,9 +730,44 @@ class Bank:
 
         account = self.accounts[account_number]
 
-        account.deposit(amount)
+        try:
+            account._operation_authorized = True
+            account.deposit(amount)
+        finally:
+            account._operation_authorized = False
 
         print("Банк успешно выполнил пополнение счёта")
+
+    def invest(self, client_id, account_number, asset_type, amount, current_hour=None):
+
+        if client_id not in self.clients:
+            raise InvalidOperationError("Клиент не найден в банке")
+
+        client = self.clients[client_id]
+
+        if client.status != "active":
+            raise InvalidOperationError("Клиент заблокирован")
+
+        if account_number not in client.account_numbers:
+            raise InvalidOperationError("Счёт не принадлежит клиенту")
+
+        if account_number not in self.accounts:
+            raise InvalidOperationError("Счёт не найден в банке")
+
+        account = self.accounts[account_number]
+
+        if not isinstance(account, InvestmentAccount):
+            raise InvalidOperationError("Инвестировать можно только с инвестиционного счёта")
+
+        self.check_operation_time(current_hour, client_id)
+
+        try:
+            account._operation_authorized = True
+            account.invest(asset_type, amount)
+        finally:
+            account._operation_authorized = False
+
+        print("Банк успешно выполнил инвестиционную операцию")
 
 
     def search_accounts(self, client_id=None, status=None, account_number=None):
@@ -736,45 +810,61 @@ class Bank:
 
     def get_total_balance(self):
 
-        total = 0
+        totals = {}
 
         for account in self.accounts.values():
 
-            total += account._balance
+            currency = account.currency
+
+            if currency not in totals:
+                totals[currency] = 0
+
+            totals[currency] += account._balance
 
             if isinstance(account, InvestmentAccount):
-                total += sum(account.portfolio.values())
+                totals[currency] += sum(account.portfolio.values())
 
-        return total
+        return totals
 
 
     def get_clients_ranking(self):
 
-        ranking = []
+        ranking = {}
 
         for client in self.clients.values():
 
-            total = 0
+            totals = {}
 
             for account_number in client.account_numbers:
 
                 account = self.accounts[account_number]
+                currency = account.currency
 
-                total += account._balance
+                if currency not in totals:
+                    totals[currency] = 0
+
+                totals[currency] += account._balance
 
                 if isinstance(account, InvestmentAccount):
-                    total += sum(account.portfolio.values())
+                    totals[currency] += sum(account.portfolio.values())
 
-            ranking.append({
-                "client_id": client.client_id,
-                "full_name": client.full_name,
-                "total_balance": total
-            })
+            for currency, total in totals.items():
 
-        ranking.sort(
-            key=lambda client: client["total_balance"],
-            reverse=True
-        )
+                if currency not in ranking:
+                    ranking[currency] = []
+
+                ranking[currency].append({
+                    "client_id": client.client_id,
+                    "full_name": client.full_name,
+                    "total_balance": total
+                })
+
+        for currency in ranking:
+
+            ranking[currency].sort(
+                key=lambda client: client["total_balance"],
+                reverse=True
+            )
 
         return ranking
 
@@ -883,7 +973,7 @@ class Transaction:
             )
 
         self.is_external = is_external
-            
+
         if type(priority) is not int or priority not in (1, 2, 3):
             raise InvalidOperationError(
                 "Приоритет должен быть целым числом от 1 до 3"
@@ -897,12 +987,12 @@ class Transaction:
             )
 
         self.scheduled_at = scheduled_at
-    
+
         self.status = "pending"
         self.failure_reason = None
-    
+
         self.created_at = datetime.now()
-        self.completed_at = None    
+        self.completed_at = None
 
     def complete(self):
 
@@ -1244,7 +1334,7 @@ class TransactionProcessor:
                 receiver_account.currency
             )
 
-        
+
         if not isinstance(sender_account, (BankAccount, PremiumAccount)):
             raise InvalidOperationError(
                 "Неподдерживаемый тип счёта отправителя"
@@ -1316,7 +1406,7 @@ class TransactionProcessor:
             self.bank.deposit(
                 receiver_client.client_id,
                 receiver_account.account_number,
-                received_amount, 
+                received_amount,
                 current_hour
             )
 
@@ -1330,7 +1420,7 @@ class TransactionProcessor:
 
         print("Перевод успешно выполнен")
         return True
-    
+
 
 if __name__ == "__main__":
 
@@ -1900,7 +1990,12 @@ if __name__ == "__main__":
     print("Статус после заморозки:", alex_savings.status)
 
     try:
-        alex_savings.withdraw(500)
+        bank.withdraw(
+            client1.client_id,
+            alex_savings.account_number,
+            500,
+            current_hour=12
+        )
     except AccountFrozenError as error:
         print("Ошибка:", error)
 
@@ -1914,7 +2009,12 @@ if __name__ == "__main__":
 
     print("Статус после разморозки:", alex_savings.status)
 
-    alex_savings.withdraw(500)
+    bank.withdraw(
+        client1.client_id,
+        alex_savings.account_number,
+        500,
+        current_hour=12
+)
 
     print("Баланс после снятия:", alex_savings.get_account_info()["balance"])
 
@@ -1944,9 +2044,14 @@ if __name__ == "__main__":
     print("Статус после закрытия:", empty_account.status)
 
 
-    # Проверяем, что закрытый счёт нельзя пополнить
+   # Проверяем, что закрытый счёт нельзя пополнить
     try:
-        empty_account.deposit(100)
+        bank.deposit(
+            client1.client_id,
+            empty_account.account_number,
+            100,
+            current_hour=12
+        )
     except AccountClosedError as error:
         print("Ошибка:", error)
 
@@ -2143,7 +2248,8 @@ if __name__ == "__main__":
 
     total_balance = bank.get_total_balance()
 
-    print("Общая сумма средств в банке:", total_balance)
+    for currency, amount in total_balance.items():
+        print(f"Общий баланс в {currency}: {amount:.2f}")
 
 
 
@@ -2151,11 +2257,16 @@ if __name__ == "__main__":
 
     ranking = bank.get_clients_ranking()
 
-    for position, client in enumerate(ranking, start=1):
-        print(
-            f"{position}. {client['full_name']} — "
-            f"{client['total_balance']} USD"
-        )
+    for currency, clients in ranking.items():
+
+        print(f"\nРейтинг клиентов в {currency}:")
+
+        for position, client in enumerate(clients, start=1):
+
+            print(
+                f"{position}. {client['full_name']} — "
+                f"{client['total_balance']:.2f} {currency}"
+            )
 
 
     print("\n--- DAY3: ПРОВЕРКА ОШИБОК ПОИСКА ---")
@@ -2384,7 +2495,7 @@ if __name__ == "__main__":
             print("Сумма:", amount, "— ошибка:", error)
 
 
-    
+
     print("\n--- DAY4: ПОДГОТОВКА БАНКОВСКОГО ПЕРЕВОДА ---")
 
     transfer_client1 = Client(
@@ -3053,3 +3164,289 @@ if __name__ == "__main__":
     print("Замороженный получатель:", frozen_receiver._balance)
     print("Обычный счёт отправителя:", transfer_account1._balance)
     print("Обычный счёт получателя:", transfer_account2._balance)
+
+
+    print("\n--- DAY3: ТЕСТ РАЗНЫХ ВАЛЮТ ---")
+
+    currency_bank = Bank("Currency Test Bank")
+
+    client_usd = Client("Test USD", 25, "+12025550101", "usd@example.com")
+    client_eur = Client("Test EUR", 30, "+12025550102", "eur@example.com")
+    client_rub = Client("Test RUB", 35, "+12025550103", "rub@example.com")
+    client_kzt = Client("Test KZT", 40, "+12025550104", "kzt@example.com")
+    client_cny = Client("Test CNY", 45, "+12025550105", "cny@example.com")
+
+    currency_bank.add_client(client_usd)
+    currency_bank.add_client(client_eur)
+    currency_bank.add_client(client_rub)
+    currency_bank.add_client(client_kzt)
+    currency_bank.add_client(client_cny)
+
+    account_usd = BankAccount(owner="Test USD", balance=100, currency="USD")
+    account_eur = BankAccount(owner="Test EUR", balance=200, currency="EUR")
+    account_rub = BankAccount(owner="Test RUB", balance=5000, currency="RUB")
+    account_kzt = BankAccount(owner="Test KZT", balance=45000, currency="KZT")
+    account_cny = BankAccount(owner="Test CNY", balance=700, currency="CNY")
+
+    currency_bank.open_account(client_usd.client_id, account_usd)
+    currency_bank.open_account(client_eur.client_id, account_eur)
+    currency_bank.open_account(client_rub.client_id, account_rub)
+    currency_bank.open_account(client_kzt.client_id, account_kzt)
+    currency_bank.open_account(client_cny.client_id, account_cny)
+
+    print("Общий баланс:", currency_bank.get_total_balance())
+
+    ranking = currency_bank.get_clients_ranking()
+
+    for currency, clients in ranking.items():
+        print(f"\nРейтинг в {currency}:")
+        for client in clients:
+            print(client["full_name"], client["total_balance"])
+
+
+
+    print("\n--- DAY3: ТЕСТ СВЯЗИ СЧЁТА С БАНКОМ ---")
+
+    print("Банк счёта USD:", account_usd._bank.name)
+    print("Счёт связан с правильным банком:", account_usd._bank is currency_bank)
+
+
+
+    print("\n--- DAY3: ТЕСТ НОЧНОГО ОГРАНИЧЕНИЯ ИНВЕСТИЦИЙ ---")
+
+    # Создаём отдельного клиента для тестирования
+    test_investor = Client(
+        "Test Investor",
+        30,
+        "+12025550110",
+        "investor@example.com"
+    )
+
+    bank.add_client(test_investor)
+
+    # Создаём инвестиционный счёт
+    test_investment = InvestmentAccount(
+        owner="Test Investor",
+        balance=1000
+    )
+
+    bank.open_account(test_investor.client_id, test_investment)
+
+    # Запоминаем начальный баланс
+    balance_before = test_investment._balance
+
+    # Тест 1. Попытка инвестирования ночью
+    try:
+        bank.invest(
+            test_investor.client_id,
+            test_investment.account_number,
+            "stocks",
+            100,
+            current_hour=2
+        )
+    except InvalidOperationError as error:
+        print("Ночная операция заблокирована:", error)
+
+    print("Баланс не изменился:", test_investment._balance == balance_before)
+
+    # Тест 2. Инвестирование днём
+    bank.invest(
+        test_investor.client_id,
+        test_investment.account_number,
+        "stocks",
+        100,
+        current_hour=12
+    )
+
+    print("Баланс после дневной инвестиции:", test_investment._balance)
+
+    # Тест 3. Прямое инвестирование
+    try:
+        test_investment.invest("stocks", 100)
+    except InvalidOperationError as error:
+        print("Прямая инвестиция заблокирована:", error)
+
+
+
+    print("\n--- DAY3: ПРОВЕРКА ЖУРНАЛА ПОДОЗРИТЕЛЬНЫХ ОПЕРАЦИЙ ---")
+
+    for activity in bank.suspicious_activities:
+        if activity["client_id"] == test_investor.client_id:
+            print("Клиент:", activity["client_id"])
+            print("Причина:", activity["reason"])
+
+
+    print("\n--- DAY3: ТЕСТ ЗАЩИТЫ ПРЯМЫХ ОПЕРАЦИЙ ---")
+
+    # Используем зарегистрированный инвестиционный счёт
+    # из предыдущего теста
+
+    balance_before = test_investment._balance
+
+    # Тест 1. Прямое пополнение
+    try:
+        test_investment.deposit(100)
+    except InvalidOperationError as error:
+        print("Прямое пополнение заблокировано:", error)
+
+    # Тест 2. Прямое снятие
+    try:
+        test_investment.withdraw(100)
+    except InvalidOperationError as error:
+        print("Прямое снятие заблокировано:", error)
+
+    # Проверяем, что баланс не изменился
+    print(
+        "Баланс не изменился:",
+        test_investment._balance == balance_before
+    )
+
+    # Проверяем, что разрешение сброшено
+    print(
+        "Разрешение после операций:",
+        test_investment._operation_authorized
+    )
+
+
+    print("\n--- DAY3: ТЕСТ ЗАЩИТЫ PREMIUM ACCOUNT ---")
+
+    premium_client = Client(
+        "Test Premium",
+        35,
+        "+12025550120",
+        "premium@example.com"
+    )
+
+    bank.add_client(premium_client)
+
+    premium_test = PremiumAccount(
+        owner="Test Premium",
+        balance=1000
+    )
+
+    bank.open_account(premium_client.client_id, premium_test)
+
+    balance_before = premium_test._balance
+
+    # Проверяем прямое снятие
+    try:
+        premium_test.withdraw(100)
+    except InvalidOperationError as error:
+        print("Прямое снятие заблокировано:", error)
+
+    print("Баланс не изменился:", premium_test._balance == balance_before)
+
+    # Проверяем снятие ночью
+    try:
+        bank.withdraw(
+            premium_client.client_id,
+            premium_test.account_number,
+            100,
+            current_hour=2
+        )
+    except InvalidOperationError as error:
+        print("Ночное снятие заблокировано:", error)
+
+    print("Баланс после ночной попытки:", premium_test._balance)
+    print("Разрешение после операций:", premium_test._operation_authorized)
+
+
+    print("\n--- DAY3: ТЕСТ ЗАЩИТЫ ОБЫЧНОГО СЧЁТА ---")
+
+    # Создаём клиента
+    regular_client = Client(
+        "Test Regular",
+        30,
+        "+12025550130",
+        "regular@example.com"
+    )
+
+    bank.add_client(regular_client)
+
+    # Создаём обычный банковский счёт
+    regular_account = BankAccount(
+        owner="Test Regular",
+        balance=1000
+    )
+
+    bank.open_account(regular_client.client_id, regular_account)
+
+    # Тест 1. Прямое снятие
+    try:
+        regular_account.withdraw(100)
+    except InvalidOperationError as error:
+        print("Прямое снятие заблокировано:", error)
+
+    # Тест 2. Прямое пополнение
+    try:
+        regular_account.deposit(100)
+    except InvalidOperationError as error:
+        print("Прямое пополнение заблокировано:", error)
+
+    # Тест 3. Ночное снятие
+    try:
+        bank.withdraw(
+            regular_client.client_id,
+            regular_account.account_number,
+            100,
+            current_hour=2
+        )
+    except InvalidOperationError as error:
+        print("Ночное снятие заблокировано:", error)
+
+    # Тест 4. Дневное снятие
+    bank.withdraw(
+        regular_client.client_id,
+        regular_account.account_number,
+        100,
+        current_hour=12
+    )
+
+    # Тест 5. Дневное пополнение
+    bank.deposit(
+        regular_client.client_id,
+        regular_account.account_number,
+        200,
+        current_hour=12
+    )
+
+    print("Итоговый баланс:", regular_account._balance)
+    print("Разрешение после операций:", regular_account._operation_authorized)
+
+
+
+    print("\n--- DAY3: ТЕСТ ПОВТОРНОЙ РЕГИСТРАЦИИ СЧЁТА ---")
+
+    # Создаём второй банк
+    second_bank = Bank("Second Test Bank")
+
+    # Создаём клиента с тем же именем
+    second_client = Client(
+        "Test Regular",
+        30,
+        "+12025550140",
+        "second@example.com"
+    )
+
+    second_bank.add_client(second_client)
+
+    # Пытаемся зарегистрировать счёт из первого банка
+    try:
+        second_bank.open_account(
+            second_client.client_id,
+            regular_account
+        )
+    except InvalidOperationError as error:
+        print("Повторная регистрация заблокирована:", error)
+
+    # Проверяем, что счёт остался в первоначальном банке
+    print(
+        "Счёт остался в первоначальном банке:",
+        regular_account._bank is bank
+    )
+
+    # Проверяем, что второй банк не получил этот счёт
+    print(
+        "Счёта нет во втором банке:",
+        regular_account.account_number not in second_bank.accounts
+    )
