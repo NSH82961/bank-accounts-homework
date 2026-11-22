@@ -491,6 +491,42 @@ class Client:
         self.password = password
         self.failed_login_attempts = 0
 
+class CurrencyConverter:
+    """
+    Конвертация валют по фиксированным учебным курсам.
+    Курс показывает, сколько единиц валюты дают за 1 USD.
+    Используется и банком (итоги, рейтинг), и процессором транзакций.
+    """
+
+    EXCHANGE_RATES = {
+        "USD": 1,
+        "EUR": 0.92,
+        "RUB": 90,
+        "KZT": 450,
+        "CNY": 7.2
+    }
+
+    @classmethod
+    def convert(cls, amount, from_currency, to_currency):
+
+        if not isinstance(amount, (int, float)) or isinstance(amount, bool):
+            raise InvalidOperationError("Сумма должна быть числом")
+
+        if not isfinite(amount):
+            raise InvalidOperationError("Сумма должна быть конечным числом")
+
+        if from_currency not in cls.EXCHANGE_RATES:
+            raise InvalidOperationError("Неизвестная исходная валюта")
+
+        if to_currency not in cls.EXCHANGE_RATES:
+            raise InvalidOperationError("Неизвестная валюта получателя")
+
+        if from_currency == to_currency:
+            return amount
+
+        amount_in_usd = amount / cls.EXCHANGE_RATES[from_currency]
+
+        return amount_in_usd * cls.EXCHANGE_RATES[to_currency]
 
 class Bank:
 
@@ -808,63 +844,92 @@ class Bank:
         return results
 
 
-    def get_total_balance(self):
+    @staticmethod
+    def _get_account_total(account):
+        """Все средства счёта: свободный баланс + инвестиционный портфель."""
 
-        totals = {}
+        total = account._balance
+
+        if isinstance(account, InvestmentAccount):
+            total += sum(account.portfolio.values())
+
+        return total
+
+    @staticmethod
+    def _validate_base_currency(base_currency):
+
+        if base_currency not in CurrencyConverter.EXCHANGE_RATES:
+            raise InvalidOperationError("Недопустимая базовая валюта")
+
+    def get_total_balance(self, base_currency="USD"):
+        """
+        Возвращает:
+        - by_currency — суммы отдельно по каждой валюте (без конвертации);
+        - total — общая сумма, приведённая к базовой валюте.
+        """
+
+        self._validate_base_currency(base_currency)
+
+        by_currency = {}
+        total = 0
 
         for account in self.accounts.values():
 
+            amount = self._get_account_total(account)
             currency = account.currency
 
-            if currency not in totals:
-                totals[currency] = 0
+            by_currency[currency] = by_currency.get(currency, 0) + amount
 
-            totals[currency] += account._balance
+            total += CurrencyConverter.convert(
+                amount, currency, base_currency
+            )
 
-            if isinstance(account, InvestmentAccount):
-                totals[currency] += sum(account.portfolio.values())
+        return {
+            "base_currency": base_currency,
+            "by_currency": by_currency,
+            "total": round(total, 2)
+        }
 
-        return totals
 
+    def get_clients_ranking(self, base_currency="USD"):
+        """
+        Единый рейтинг клиентов: средства всех счетов клиента
+        переводятся в базовую валюту, затем клиенты сортируются.
+        """
 
-    def get_clients_ranking(self):
+        self._validate_base_currency(base_currency)
 
-        ranking = {}
+        ranking = []
 
         for client in self.clients.values():
 
-            totals = {}
+            by_currency = {}
+            total = 0
 
             for account_number in client.account_numbers:
 
                 account = self.accounts[account_number]
+                amount = self._get_account_total(account)
                 currency = account.currency
 
-                if currency not in totals:
-                    totals[currency] = 0
+                by_currency[currency] = by_currency.get(currency, 0) + amount
 
-                totals[currency] += account._balance
+                total += CurrencyConverter.convert(
+                    amount, currency, base_currency
+                )
 
-                if isinstance(account, InvestmentAccount):
-                    totals[currency] += sum(account.portfolio.values())
+            ranking.append({
+                "client_id": client.client_id,
+                "full_name": client.full_name,
+                "total_balance": round(total, 2),
+                "base_currency": base_currency,
+                "balances_by_currency": by_currency
+            })
 
-            for currency, total in totals.items():
-
-                if currency not in ranking:
-                    ranking[currency] = []
-
-                ranking[currency].append({
-                    "client_id": client.client_id,
-                    "full_name": client.full_name,
-                    "total_balance": total
-                })
-
-        for currency in ranking:
-
-            ranking[currency].sort(
-                key=lambda client: client["total_balance"],
-                reverse=True
-            )
+        ranking.sort(
+            key=lambda item: item["total_balance"],
+            reverse=True
+        )
 
         return ranking
 
@@ -959,6 +1024,31 @@ class Transaction:
                 "Комиссия должна быть неотрицательным конечным числом"
             )
 
+        # Участники операции зависят от её типа:
+        # transfer — отправитель и получатель,
+        # deposit  — только получатель (деньги поступают извне),
+        # withdraw — только отправитель (деньги выдаются наружу).
+        def is_account_number(value):
+            return isinstance(value, str) and bool(value.strip())
+
+        if transaction_type == "transfer":
+            if not is_account_number(sender) or not is_account_number(receiver):
+                raise InvalidOperationError(
+                    "Для перевода нужны счёт отправителя и счёт получателя"
+                )
+
+        elif transaction_type == "deposit":
+            if sender is not None or not is_account_number(receiver):
+                raise InvalidOperationError(
+                    "Для пополнения нужен только счёт получателя (sender=None)"
+                )
+
+        elif transaction_type == "withdraw":
+            if not is_account_number(sender) or receiver is not None:
+                raise InvalidOperationError(
+                    "Для снятия нужен только счёт отправителя (receiver=None)"
+                )
+        
         self.transaction_id = str(uuid4())[:8]
         self.transaction_type = transaction_type
         self.amount = amount
@@ -1118,14 +1208,6 @@ class TransactionProcessor:
 
     def convert_currency(self, amount, from_currency, to_currency):
 
-        exchange_rates = {
-            "USD": 1,
-            "EUR": 0.92,
-            "RUB": 90,
-            "KZT": 450,
-            "CNY": 7.2
-        }
-
         if not isinstance(amount, (int, float)) or isinstance(amount, bool):
             raise InvalidOperationError(
                 "Сумма должна быть числом"
@@ -1136,19 +1218,9 @@ class TransactionProcessor:
                 "Сумма должна быть положительным конечным числом"
             )
 
-        if from_currency not in exchange_rates:
-            raise InvalidOperationError(
-                "Неизвестная исходная валюта"
-            )
-
-        if to_currency not in exchange_rates:
-            raise InvalidOperationError(
-                "Неизвестная валюта получателя"
-            )
-
-        amount_in_usd = amount / exchange_rates[from_currency]
-
-        converted_amount = amount_in_usd * exchange_rates[to_currency]
+        converted_amount = CurrencyConverter.convert(
+            amount, from_currency, to_currency
+        )
 
         return round(converted_amount, 2)
 
@@ -1280,40 +1352,80 @@ class TransactionProcessor:
             "Владелец банковского счёта не найден"
         )
 
-    def process_transaction(self, transaction, current_hour=None):
+    def _get_account_and_owner(self, account_number, role):
+        """Находит счёт и его владельца. role — 'отправителя' / 'получателя'."""
 
-        if not isinstance(transaction, Transaction):
+        if account_number not in self.bank.accounts:
+            raise InvalidOperationError(f"Счёт {role} не найден")
+
+        account = self.bank.accounts[account_number]
+        owner = self.find_account_owner(account_number)
+
+        # Общий тип для всех счетов: BankAccount и его наследники
+        # (SavingsAccount, PremiumAccount, InvestmentAccount)
+        if not isinstance(account, BankAccount):
             raise InvalidOperationError(
-                "Передан неправильный объект транзакции"
+                f"Неподдерживаемый тип счёта {role}"
             )
 
-        if transaction.status != "pending":
-            raise InvalidOperationError(
-                "Транзакция уже обработана или отменена"
+        if account.status != "active":
+            raise InvalidOperationError(f"Счёт {role} неактивен")
+
+        return account, owner
+
+    def _apply_fee(self, transaction):
+        """Для внешних операций комиссия рассчитывается автоматически."""
+
+        if transaction.is_external:
+            transaction.fee = self.calculate_fee(
+                transaction.amount,
+                is_external=True
             )
 
-        if transaction.transaction_type != "transfer":
-            raise InvalidOperationError(
-                "Пока поддерживаются только переводы"
-            )
+        return transaction.amount + transaction.fee
 
-        if transaction.scheduled_at is not None:
-            if transaction.scheduled_at > datetime.now():
+    def _check_can_withdraw(self, account, total_amount):
+        """
+        Проверка средств до изменения балансов.
+        Правила зависят от типа счёта (полиморфное поведение из Day2).
+        """
+
+        if isinstance(account, PremiumAccount):
+
+            if total_amount > account.withdrawal_limit:
                 raise InvalidOperationError(
-                    "Время выполнения транзакции ещё не наступило"
+                    "Превышен лимит снятия премиального счёта"
                 )
 
-        if transaction.sender not in self.bank.accounts:
-            raise InvalidOperationError("Счёт отправителя не найден")
+            premium_total = total_amount + account.transaction_fee
 
-        if transaction.receiver not in self.bank.accounts:
-            raise InvalidOperationError("Счёт получателя не найден")
+            if account._balance - premium_total < -account.overdraft_limit:
+                raise InsufficientFundsError(
+                    "Превышен лимит овердрафта"
+                )
 
-        sender_account = self.bank.accounts[transaction.sender]
-        receiver_account = self.bank.accounts[transaction.receiver]
+        elif isinstance(account, SavingsAccount):
 
-        sender_client = self.find_account_owner(transaction.sender)
-        receiver_client = self.find_account_owner(transaction.receiver)
+            if account._balance - total_amount < account.min_balance:
+                raise InsufficientFundsError(
+                    "Операция нарушит минимальный остаток сберегательного счёта"
+                )
+
+        else:
+
+            if account._balance < total_amount:
+                raise InsufficientFundsError(
+                    "Недостаточно средств для операции с учётом комиссии"
+                )
+
+    def _process_transfer(self, transaction, current_hour):
+
+        sender_account, sender_client = self._get_account_and_owner(
+            transaction.sender, "отправителя"
+        )
+        receiver_account, receiver_client = self._get_account_and_owner(
+            transaction.receiver, "получателя"
+        )
 
         if transaction.sender == transaction.receiver:
             raise InvalidOperationError(
@@ -1334,55 +1446,9 @@ class TransactionProcessor:
                 receiver_account.currency
             )
 
+        total_amount = self._apply_fee(transaction)
 
-        if not isinstance(sender_account, (BankAccount, PremiumAccount)):
-            raise InvalidOperationError(
-                "Неподдерживаемый тип счёта отправителя"
-            )
-
-        if type(receiver_account) is not BankAccount:
-            raise InvalidOperationError(
-                "Пока поддерживается перевод только на обычный счёт"
-            )
-
-        if sender_account.status != "active":
-            raise InvalidOperationError(
-                "Счёт отправителя неактивен"
-            )
-
-        if receiver_account.status != "active":
-            raise InvalidOperationError(
-                "Счёт получателя неактивен"
-            )
-
-        if transaction.is_external:
-            transaction.fee = self.calculate_fee(
-                transaction.amount,
-                is_external=True
-            )
-
-        total_amount = transaction.amount + transaction.fee
-
-        if isinstance(sender_account, PremiumAccount):
-
-            premium_total = total_amount + sender_account.transaction_fee
-
-            if total_amount > sender_account.withdrawal_limit:
-                raise InvalidOperationError(
-                    "Превышен лимит снятия премиального счёта"
-                )
-
-            if sender_account._balance - premium_total < -sender_account.overdraft_limit:
-                raise InsufficientFundsError(
-                    "Превышен лимит овердрафта"
-                )
-
-        else:
-
-            if sender_account._balance < total_amount:
-                raise InsufficientFundsError(
-                    "Недостаточно средств для перевода с учётом комиссии"
-                )
+        self._check_can_withdraw(sender_account, total_amount)
 
         self.bank.check_operation_time(
             current_hour, sender_client.client_id
@@ -1415,10 +1481,92 @@ class TransactionProcessor:
             receiver_account._balance = receiver_balance_before
             raise
 
+        print("Перевод успешно выполнен")
+
+    def _process_deposit(self, transaction, current_hour):
+
+        receiver_account, receiver_client = self._get_account_and_owner(
+            transaction.receiver, "получателя"
+        )
+
+        if transaction.fee != 0 or transaction.is_external:
+            raise InvalidOperationError(
+                "Комиссия за пополнение не предусмотрена"
+            )
+
+        received_amount = transaction.amount
+
+        if receiver_account.currency != transaction.currency:
+            received_amount = self.convert_currency(
+                transaction.amount,
+                transaction.currency,
+                receiver_account.currency
+            )
+
+        self.bank.deposit(
+            receiver_client.client_id,
+            receiver_account.account_number,
+            received_amount,
+            current_hour
+        )
+
+        print("Пополнение по транзакции выполнено")
+
+    def _process_withdraw(self, transaction, current_hour):
+
+        sender_account, sender_client = self._get_account_and_owner(
+            transaction.sender, "отправителя"
+        )
+
+        if sender_account.currency != transaction.currency:
+            raise InvalidOperationError(
+                "Валюта счёта не совпадает с валютой транзакции"
+            )
+
+        total_amount = self._apply_fee(transaction)
+
+        self._check_can_withdraw(sender_account, total_amount)
+
+        self.bank.withdraw(
+            sender_client.client_id,
+            sender_account.account_number,
+            total_amount,
+            current_hour
+        )
+
+        print("Снятие по транзакции выполнено")
+
+    def process_transaction(self, transaction, current_hour=None):
+
+        if not isinstance(transaction, Transaction):
+            raise InvalidOperationError(
+                "Передан неправильный объект транзакции"
+            )
+
+        if transaction.status != "pending":
+            raise InvalidOperationError(
+                "Транзакция уже обработана или отменена"
+            )
+
+        if transaction.scheduled_at is not None:
+            if transaction.scheduled_at > datetime.now():
+                raise InvalidOperationError(
+                    "Время выполнения транзакции ещё не наступило"
+                )
+
+        # Каждому типу транзакции — свой обработчик.
+        # Новый тип операции добавляется новым методом и строкой в словаре.
+        handlers = {
+            "transfer": self._process_transfer,
+            "deposit": self._process_deposit,
+            "withdraw": self._process_withdraw
+        }
+
+        handlers[transaction.transaction_type](transaction, current_hour)
+
         transaction.complete()
         self.processed_transactions.append(transaction)
 
-        print("Перевод успешно выполнен")
         return True
 
 
@@ -2246,27 +2394,28 @@ if __name__ == "__main__":
 
     print("\n--- DAY3: ОБЩИЙ БАЛАНС БАНКА ---")
 
-    total_balance = bank.get_total_balance()
+    total_balance = bank.get_total_balance("USD")
 
-    for currency, amount in total_balance.items():
-        print(f"Общий баланс в {currency}: {amount:.2f}")
+    for currency, amount in total_balance["by_currency"].items():
+        print(f"Сумма в {currency}: {amount:.2f}")
+
+    print(
+        f"Итого в базовой валюте: "
+        f"{total_balance['total']:.2f} {total_balance['base_currency']}"
+    )
 
 
 
     print("\n--- DAY3: РЕЙТИНГ КЛИЕНТОВ ---")
 
-    ranking = bank.get_clients_ranking()
+    ranking = bank.get_clients_ranking("USD")
 
-    for currency, clients in ranking.items():
+    for position, client in enumerate(ranking, start=1):
 
-        print(f"\nРейтинг клиентов в {currency}:")
-
-        for position, client in enumerate(clients, start=1):
-
-            print(
-                f"{position}. {client['full_name']} — "
-                f"{client['total_balance']:.2f} {currency}"
-            )
+        print(
+            f"{position}. {client['full_name']} — "
+            f"{client['total_balance']:.2f} {client['base_currency']}"
+        )
 
 
     print("\n--- DAY3: ПРОВЕРКА ОШИБОК ПОИСКА ---")
@@ -3194,14 +3343,21 @@ if __name__ == "__main__":
     currency_bank.open_account(client_kzt.client_id, account_kzt)
     currency_bank.open_account(client_cny.client_id, account_cny)
 
-    print("Общий баланс:", currency_bank.get_total_balance())
+    total_balance = currency_bank.get_total_balance("USD")
 
-    ranking = currency_bank.get_clients_ranking()
+    print("Суммы по валютам:", total_balance["by_currency"])
+    print("Итого:", total_balance["total"], total_balance["base_currency"])
 
-    for currency, clients in ranking.items():
-        print(f"\nРейтинг в {currency}:")
-        for client in clients:
-            print(client["full_name"], client["total_balance"])
+    print("\nЕдиный рейтинг в USD:")
+
+    for position, client in enumerate(
+        currency_bank.get_clients_ranking("USD"), start=1
+    ):
+        print(
+            f"{position}. {client['full_name']} — "
+            f"{client['total_balance']:.2f} USD "
+            f"(на счетах: {client['balances_by_currency']})"
+        )
 
 
 
@@ -3450,3 +3606,288 @@ if __name__ == "__main__":
         "Счёта нет во втором банке:",
         regular_account.account_number not in second_bank.accounts
     )
+
+
+
+
+    print("\n" + "=" * 60)
+    print("DAY4: ИСПРАВЛЕНИЯ ПО РЕЗУЛЬТАТАМ CODE REVIEW")
+    print("=" * 60)
+
+    review_bank = Bank("Review Fix Bank")
+    review_processor = TransactionProcessor(review_bank)
+
+    review_sender = Client("Review Sender", 30, "+10000000001", "rs@example.com")
+    review_receiver = Client("Review Receiver", 32, "+10000000002", "rr@example.com")
+
+    review_bank.add_client(review_sender)
+    review_bank.add_client(review_receiver)
+
+    sender_main = BankAccount(owner="Review Sender", balance=5000, currency="USD")
+    sender_savings = SavingsAccount(
+        owner="Review Sender", balance=1000, min_balance=800, currency="USD"
+    )
+
+    receiver_savings = SavingsAccount(
+        owner="Review Receiver", balance=500, min_balance=100, currency="USD"
+    )
+    receiver_premium = PremiumAccount(
+        owner="Review Receiver", balance=100, currency="USD"
+    )
+    receiver_investment = InvestmentAccount(
+        owner="Review Receiver", balance=0, currency="EUR"
+    )
+
+    for client, account in [
+        (review_sender, sender_main),
+        (review_sender, sender_savings),
+        (review_receiver, receiver_savings),
+        (review_receiver, receiver_premium),
+        (review_receiver, receiver_investment),
+    ]:
+        review_bank.open_account(client.client_id, account)
+
+
+    print("\n--- 1. ПЕРЕВОДЫ НА СПЕЦИАЛИЗИРОВАННЫЕ СЧЕТА ---")
+
+    for receiver_account in [receiver_savings, receiver_premium, receiver_investment]:
+
+        balance_before = receiver_account._balance
+
+        transfer = Transaction(
+            "transfer", 100, "USD",
+            sender_main.account_number,
+            receiver_account.account_number
+        )
+
+        result = review_processor.process_safely(transfer, current_hour=12)
+
+        print(
+            f"{type(receiver_account).__name__}: результат={result}, "
+            f"статус={transfer.status}, "
+            f"баланс {balance_before} -> {receiver_account._balance} "
+            f"{receiver_account.currency}"
+        )
+
+    print("\nПеревод на замороженный SavingsAccount:")
+
+    review_bank.freeze_account(receiver_savings.account_number)
+
+    balance_before = sender_main._balance
+
+    frozen_transfer = Transaction(
+        "transfer", 100, "USD",
+        sender_main.account_number,
+        receiver_savings.account_number
+    )
+
+    result = review_processor.process_safely(frozen_transfer, current_hour=12)
+
+    print("Результат:", result, "| Причина:", frozen_transfer.failure_reason)
+    print("Баланс отправителя не изменился:", sender_main._balance == balance_before)
+
+    review_bank.unfreeze_account(receiver_savings.account_number)
+
+    print("\nПеревод с SavingsAccount ниже минимального остатка:")
+
+    savings_transfer = Transaction(
+        "transfer", 300, "USD",
+        sender_savings.account_number,
+        receiver_premium.account_number
+    )
+
+    result = review_processor.process_safely(savings_transfer, current_hour=12)
+
+    print("Результат:", result, "| Причина:", savings_transfer.failure_reason)
+    print("Баланс SavingsAccount:", sender_savings._balance)
+
+    print("\nВалюта транзакции не совпадает с валютой отправителя:")
+
+    wrong_currency = Transaction(
+        "transfer", 100, "EUR",
+        sender_main.account_number,
+        receiver_premium.account_number
+    )
+
+    result = review_processor.process_safely(wrong_currency, current_hour=12)
+
+    print("Результат:", result, "| Причина:", wrong_currency.failure_reason)
+
+
+    print("\n--- 2. ЕДИНАЯ ВАЛЮТА ДЛЯ БАЛАНСА И РЕЙТИНГА ---")
+
+    fx_bank = Bank("FX Bank")
+
+    usd_client = Client("Small USD", 30, "+10000000003", "usd2@example.com")
+    rub_client = Client("Big RUB", 30, "+10000000004", "rub2@example.com")
+
+    fx_bank.add_client(usd_client)
+    fx_bank.add_client(rub_client)
+
+    fx_bank.open_account(
+        usd_client.client_id,
+        BankAccount(owner="Small USD", balance=2, currency="USD")
+    )
+    fx_bank.open_account(
+        rub_client.client_id,
+        BankAccount(owner="Big RUB", balance=100, currency="RUB")
+    )
+
+    fx_total = fx_bank.get_total_balance("USD")
+
+    print("Суммы по валютам:", fx_total["by_currency"])
+    print("Итого в USD:", fx_total["total"])
+
+    print("\nРейтинг в USD (2 USD должны быть выше 100 RUB):")
+
+    for position, client in enumerate(fx_bank.get_clients_ranking("USD"), start=1):
+        print(f"{position}. {client['full_name']} — {client['total_balance']} USD")
+
+    print("\nТот же рейтинг в RUB:")
+
+    for position, client in enumerate(fx_bank.get_clients_ranking("RUB"), start=1):
+        print(f"{position}. {client['full_name']} — {client['total_balance']} RUB")
+
+    try:
+        fx_bank.get_clients_ranking("GBP")
+    except InvalidOperationError as error:
+        print("\nНедопустимая базовая валюта:", error)
+
+
+    print("\n--- 3. ТРАНЗАКЦИИ DEPOSIT И WITHDRAW ---")
+
+    print("\nПополнение USD-счёта:")
+
+    balance_before = sender_main._balance
+
+    deposit_transaction = Transaction(
+        "deposit", 250, "USD",
+        sender=None,
+        receiver=sender_main.account_number
+    )
+
+    result = review_processor.process_safely(deposit_transaction, current_hour=12)
+
+    print(
+        "Результат:", result, "| Статус:", deposit_transaction.status,
+        "| Баланс:", balance_before, "->", sender_main._balance
+    )
+
+    print("\nПополнение EUR-счёта в USD (с конвертацией):")
+
+    balance_before = receiver_investment._balance
+
+    fx_deposit = Transaction(
+        "deposit", 100, "USD",
+        sender=None,
+        receiver=receiver_investment.account_number
+    )
+
+    result = review_processor.process_safely(fx_deposit, current_hour=12)
+
+    print(
+        "Результат:", result,
+        "| Баланс:", balance_before, "->", receiver_investment._balance, "EUR"
+    )
+
+    print("\nСнятие с внешней комиссией 2%:")
+
+    balance_before = sender_main._balance
+
+    withdraw_transaction = Transaction(
+        "withdraw", 500, "USD",
+        sender=sender_main.account_number,
+        receiver=None,
+        is_external=True
+    )
+
+    result = review_processor.process_safely(withdraw_transaction, current_hour=12)
+
+    print(
+        "Результат:", result, "| Комиссия:", withdraw_transaction.fee,
+        "| Баланс:", balance_before, "->", sender_main._balance
+    )
+
+    print("\nСнятие больше доступного:")
+
+    balance_before = sender_main._balance
+
+    big_withdraw = Transaction(
+        "withdraw", 100000, "USD",
+        sender=sender_main.account_number,
+        receiver=None
+    )
+
+    result = review_processor.process_safely(big_withdraw, current_hour=12)
+
+    print("Результат:", result, "| Причина:", big_withdraw.failure_reason)
+    print("Баланс не изменился:", sender_main._balance == balance_before)
+
+    print("\nСнятие ночью:")
+
+    night_withdraw = Transaction(
+        "withdraw", 10, "USD",
+        sender=sender_main.account_number,
+        receiver=None
+    )
+
+    result = review_processor.process_safely(night_withdraw, current_hour=2)
+
+    print("Результат:", result, "| Причина:", night_withdraw.failure_reason)
+
+    print("\nПополнение замороженного счёта:")
+
+    review_bank.freeze_account(receiver_premium.account_number)
+
+    frozen_deposit = Transaction(
+        "deposit", 50, "USD",
+        sender=None,
+        receiver=receiver_premium.account_number
+    )
+
+    result = review_processor.process_safely(frozen_deposit, current_hour=12)
+
+    print("Результат:", result, "| Причина:", frozen_deposit.failure_reason)
+
+    review_bank.unfreeze_account(receiver_premium.account_number)
+
+    print("\nНекорректные участники транзакций:")
+
+    invalid_cases = [
+        ("deposit", "ACC001", "ACC002"),
+        ("withdraw", None, None),
+        ("transfer", "ACC001", None),
+    ]
+
+    for transaction_type, sender, receiver in invalid_cases:
+        try:
+            Transaction(transaction_type, 100, "USD", sender, receiver)
+        except InvalidOperationError as error:
+            print(f"{transaction_type}: ошибка — {error}")
+
+    print("\nСмешанная очередь из трёх типов операций:")
+
+    mixed_queue = TransactionQueue()
+
+    mixed_queue.add_transaction(Transaction(
+        "deposit", 40, "USD", None, sender_main.account_number, priority=1
+    ))
+    mixed_queue.add_transaction(Transaction(
+        "withdraw", 30, "USD", sender_main.account_number, None, priority=3
+    ))
+    mixed_queue.add_transaction(Transaction(
+        "transfer", 20, "USD",
+        sender_main.account_number, receiver_savings.account_number,
+        priority=2
+    ))
+
+    for transaction in mixed_queue.get_ready_transactions():
+        result = review_processor.process_safely(transaction, current_hour=12)
+        print(
+            f"{transaction.transaction_type:8} | приоритет {transaction.priority} "
+            f"| результат {result} | статус {transaction.status}"
+        )
+
+    print("\nИтог процессора:")
+    print("Обработано транзакций:", review_processor.get_transaction_count())
+    print("Ошибок в журнале:", len(review_processor.error_log))    
