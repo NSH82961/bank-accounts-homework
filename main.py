@@ -1090,6 +1090,10 @@ class Transaction:
         self.created_at = datetime.now()
         self.completed_at = None
 
+        # Заполняется анализатором рисков (Day5)
+        self.risk_level = None
+        self.risk_factors = []
+
     def complete(self):
 
         if self.status != "pending":
@@ -1187,10 +1191,74 @@ class TransactionQueue:
 
 class TransactionProcessor:
 
-    def __init__(self, bank):
+    def __init__(self, bank, audit_log=None, risk_analyzer=None):
         self.bank = bank
         self.processed_transactions = []
         self.error_log = []
+
+        # Day5: журнал аудита и анализатор рисков подключаются по желанию
+        self.audit_log = audit_log
+        self.risk_analyzer = risk_analyzer
+
+    def _audit(self, level, event_type, message, transaction, details=None):
+        """Пишет событие в журнал аудита, если он подключён."""
+
+        if self.audit_log is None:
+            return
+
+        client_id = None
+
+        if self.risk_analyzer is not None:
+            try:
+                client_id = self.risk_analyzer.get_initiator_id(transaction)
+            except InvalidOperationError:
+                client_id = None
+
+        self.audit_log.log(
+            level, event_type, message,
+            client_id=client_id,
+            transaction_id=transaction.transaction_id,
+            details=details
+        )
+
+    def _assess_risk(self, transaction, current_hour):
+        """Оценка риска. Операции с высоким риском блокируются."""
+
+        risk = self.risk_analyzer.analyze(transaction, current_hour)
+
+        transaction.risk_level = risk["level"]
+        transaction.risk_factors = risk["factor_names"]
+
+        blocked = risk["level"] == "high"
+
+        audit_levels = {"low": "INFO", "medium": "WARNING", "high": "CRITICAL"}
+
+        self._audit(
+            audit_levels[risk["level"]],
+            "risk_assessment",
+            f"Риск операции: {risk['level']}",
+            transaction,
+            details={
+                "risk_level": risk["level"],
+                "score": risk["score"],
+                "factor_names": risk["factor_names"],
+                "blocked": blocked,
+                "amount": transaction.amount,
+                "currency": transaction.currency,
+                "transaction_type": transaction.transaction_type
+            }
+        )
+
+        if blocked:
+            self.bank.flag_suspicious_activity(
+                risk["client_id"],
+                "Операция заблокирована: высокий риск"
+            )
+
+            raise SuspiciousOperationError(
+                "Операция заблокирована системой анализа рисков: "
+                + ", ".join(risk["factor_names"])
+            )
 
     def get_transaction_count(self):
         return len(self.processed_transactions)
@@ -1268,6 +1336,18 @@ class TransactionProcessor:
         }
 
         self.error_log.append(error_info)
+
+        
+        self._audit(
+            "ERROR",
+            "transaction_failed",
+            str(error),
+            transaction,
+            details={
+                "error_type": type(error).__name__,
+                "transaction_type": transaction.transaction_type
+            }
+        )
 
         if transaction.status == "pending":
             transaction.fail(str(error))
@@ -1568,10 +1648,29 @@ class TransactionProcessor:
             "withdraw": self._process_withdraw
         }
 
+        if self.risk_analyzer is not None:
+            self._assess_risk(transaction, current_hour)
+
         handlers[transaction.transaction_type](transaction, current_hour)
 
         transaction.complete()
         self.processed_transactions.append(transaction)
+
+        if self.risk_analyzer is not None:
+            self.risk_analyzer.record_operation(transaction)
+
+        self._audit(
+            "INFO",
+            "transaction_completed",
+            "Операция выполнена",
+            transaction,
+            details={
+                "transaction_type": transaction.transaction_type,
+                "amount": transaction.amount,
+                "currency": transaction.currency,
+                "fee": transaction.fee
+            }
+        )
 
         return True
 
