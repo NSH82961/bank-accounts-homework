@@ -3606,3 +3606,288 @@ if __name__ == "__main__":
         "Счёта нет во втором банке:",
         regular_account.account_number not in second_bank.accounts
     )
+
+
+
+
+    print("\n" + "=" * 60)
+    print("DAY4: ИСПРАВЛЕНИЯ ПО РЕЗУЛЬТАТАМ CODE REVIEW")
+    print("=" * 60)
+
+    review_bank = Bank("Review Fix Bank")
+    review_processor = TransactionProcessor(review_bank)
+
+    review_sender = Client("Review Sender", 30, "+10000000001", "rs@example.com")
+    review_receiver = Client("Review Receiver", 32, "+10000000002", "rr@example.com")
+
+    review_bank.add_client(review_sender)
+    review_bank.add_client(review_receiver)
+
+    sender_main = BankAccount(owner="Review Sender", balance=5000, currency="USD")
+    sender_savings = SavingsAccount(
+        owner="Review Sender", balance=1000, min_balance=800, currency="USD"
+    )
+
+    receiver_savings = SavingsAccount(
+        owner="Review Receiver", balance=500, min_balance=100, currency="USD"
+    )
+    receiver_premium = PremiumAccount(
+        owner="Review Receiver", balance=100, currency="USD"
+    )
+    receiver_investment = InvestmentAccount(
+        owner="Review Receiver", balance=0, currency="EUR"
+    )
+
+    for client, account in [
+        (review_sender, sender_main),
+        (review_sender, sender_savings),
+        (review_receiver, receiver_savings),
+        (review_receiver, receiver_premium),
+        (review_receiver, receiver_investment),
+    ]:
+        review_bank.open_account(client.client_id, account)
+
+
+    print("\n--- 1. ПЕРЕВОДЫ НА СПЕЦИАЛИЗИРОВАННЫЕ СЧЕТА ---")
+
+    for receiver_account in [receiver_savings, receiver_premium, receiver_investment]:
+
+        balance_before = receiver_account._balance
+
+        transfer = Transaction(
+            "transfer", 100, "USD",
+            sender_main.account_number,
+            receiver_account.account_number
+        )
+
+        result = review_processor.process_safely(transfer, current_hour=12)
+
+        print(
+            f"{type(receiver_account).__name__}: результат={result}, "
+            f"статус={transfer.status}, "
+            f"баланс {balance_before} -> {receiver_account._balance} "
+            f"{receiver_account.currency}"
+        )
+
+    print("\nПеревод на замороженный SavingsAccount:")
+
+    review_bank.freeze_account(receiver_savings.account_number)
+
+    balance_before = sender_main._balance
+
+    frozen_transfer = Transaction(
+        "transfer", 100, "USD",
+        sender_main.account_number,
+        receiver_savings.account_number
+    )
+
+    result = review_processor.process_safely(frozen_transfer, current_hour=12)
+
+    print("Результат:", result, "| Причина:", frozen_transfer.failure_reason)
+    print("Баланс отправителя не изменился:", sender_main._balance == balance_before)
+
+    review_bank.unfreeze_account(receiver_savings.account_number)
+
+    print("\nПеревод с SavingsAccount ниже минимального остатка:")
+
+    savings_transfer = Transaction(
+        "transfer", 300, "USD",
+        sender_savings.account_number,
+        receiver_premium.account_number
+    )
+
+    result = review_processor.process_safely(savings_transfer, current_hour=12)
+
+    print("Результат:", result, "| Причина:", savings_transfer.failure_reason)
+    print("Баланс SavingsAccount:", sender_savings._balance)
+
+    print("\nВалюта транзакции не совпадает с валютой отправителя:")
+
+    wrong_currency = Transaction(
+        "transfer", 100, "EUR",
+        sender_main.account_number,
+        receiver_premium.account_number
+    )
+
+    result = review_processor.process_safely(wrong_currency, current_hour=12)
+
+    print("Результат:", result, "| Причина:", wrong_currency.failure_reason)
+
+
+    print("\n--- 2. ЕДИНАЯ ВАЛЮТА ДЛЯ БАЛАНСА И РЕЙТИНГА ---")
+
+    fx_bank = Bank("FX Bank")
+
+    usd_client = Client("Small USD", 30, "+10000000003", "usd2@example.com")
+    rub_client = Client("Big RUB", 30, "+10000000004", "rub2@example.com")
+
+    fx_bank.add_client(usd_client)
+    fx_bank.add_client(rub_client)
+
+    fx_bank.open_account(
+        usd_client.client_id,
+        BankAccount(owner="Small USD", balance=2, currency="USD")
+    )
+    fx_bank.open_account(
+        rub_client.client_id,
+        BankAccount(owner="Big RUB", balance=100, currency="RUB")
+    )
+
+    fx_total = fx_bank.get_total_balance("USD")
+
+    print("Суммы по валютам:", fx_total["by_currency"])
+    print("Итого в USD:", fx_total["total"])
+
+    print("\nРейтинг в USD (2 USD должны быть выше 100 RUB):")
+
+    for position, client in enumerate(fx_bank.get_clients_ranking("USD"), start=1):
+        print(f"{position}. {client['full_name']} — {client['total_balance']} USD")
+
+    print("\nТот же рейтинг в RUB:")
+
+    for position, client in enumerate(fx_bank.get_clients_ranking("RUB"), start=1):
+        print(f"{position}. {client['full_name']} — {client['total_balance']} RUB")
+
+    try:
+        fx_bank.get_clients_ranking("GBP")
+    except InvalidOperationError as error:
+        print("\nНедопустимая базовая валюта:", error)
+
+
+    print("\n--- 3. ТРАНЗАКЦИИ DEPOSIT И WITHDRAW ---")
+
+    print("\nПополнение USD-счёта:")
+
+    balance_before = sender_main._balance
+
+    deposit_transaction = Transaction(
+        "deposit", 250, "USD",
+        sender=None,
+        receiver=sender_main.account_number
+    )
+
+    result = review_processor.process_safely(deposit_transaction, current_hour=12)
+
+    print(
+        "Результат:", result, "| Статус:", deposit_transaction.status,
+        "| Баланс:", balance_before, "->", sender_main._balance
+    )
+
+    print("\nПополнение EUR-счёта в USD (с конвертацией):")
+
+    balance_before = receiver_investment._balance
+
+    fx_deposit = Transaction(
+        "deposit", 100, "USD",
+        sender=None,
+        receiver=receiver_investment.account_number
+    )
+
+    result = review_processor.process_safely(fx_deposit, current_hour=12)
+
+    print(
+        "Результат:", result,
+        "| Баланс:", balance_before, "->", receiver_investment._balance, "EUR"
+    )
+
+    print("\nСнятие с внешней комиссией 2%:")
+
+    balance_before = sender_main._balance
+
+    withdraw_transaction = Transaction(
+        "withdraw", 500, "USD",
+        sender=sender_main.account_number,
+        receiver=None,
+        is_external=True
+    )
+
+    result = review_processor.process_safely(withdraw_transaction, current_hour=12)
+
+    print(
+        "Результат:", result, "| Комиссия:", withdraw_transaction.fee,
+        "| Баланс:", balance_before, "->", sender_main._balance
+    )
+
+    print("\nСнятие больше доступного:")
+
+    balance_before = sender_main._balance
+
+    big_withdraw = Transaction(
+        "withdraw", 100000, "USD",
+        sender=sender_main.account_number,
+        receiver=None
+    )
+
+    result = review_processor.process_safely(big_withdraw, current_hour=12)
+
+    print("Результат:", result, "| Причина:", big_withdraw.failure_reason)
+    print("Баланс не изменился:", sender_main._balance == balance_before)
+
+    print("\nСнятие ночью:")
+
+    night_withdraw = Transaction(
+        "withdraw", 10, "USD",
+        sender=sender_main.account_number,
+        receiver=None
+    )
+
+    result = review_processor.process_safely(night_withdraw, current_hour=2)
+
+    print("Результат:", result, "| Причина:", night_withdraw.failure_reason)
+
+    print("\nПополнение замороженного счёта:")
+
+    review_bank.freeze_account(receiver_premium.account_number)
+
+    frozen_deposit = Transaction(
+        "deposit", 50, "USD",
+        sender=None,
+        receiver=receiver_premium.account_number
+    )
+
+    result = review_processor.process_safely(frozen_deposit, current_hour=12)
+
+    print("Результат:", result, "| Причина:", frozen_deposit.failure_reason)
+
+    review_bank.unfreeze_account(receiver_premium.account_number)
+
+    print("\nНекорректные участники транзакций:")
+
+    invalid_cases = [
+        ("deposit", "ACC001", "ACC002"),
+        ("withdraw", None, None),
+        ("transfer", "ACC001", None),
+    ]
+
+    for transaction_type, sender, receiver in invalid_cases:
+        try:
+            Transaction(transaction_type, 100, "USD", sender, receiver)
+        except InvalidOperationError as error:
+            print(f"{transaction_type}: ошибка — {error}")
+
+    print("\nСмешанная очередь из трёх типов операций:")
+
+    mixed_queue = TransactionQueue()
+
+    mixed_queue.add_transaction(Transaction(
+        "deposit", 40, "USD", None, sender_main.account_number, priority=1
+    ))
+    mixed_queue.add_transaction(Transaction(
+        "withdraw", 30, "USD", sender_main.account_number, None, priority=3
+    ))
+    mixed_queue.add_transaction(Transaction(
+        "transfer", 20, "USD",
+        sender_main.account_number, receiver_savings.account_number,
+        priority=2
+    ))
+
+    for transaction in mixed_queue.get_ready_transactions():
+        result = review_processor.process_safely(transaction, current_hour=12)
+        print(
+            f"{transaction.transaction_type:8} | приоритет {transaction.priority} "
+            f"| результат {result} | статус {transaction.status}"
+        )
+
+    print("\nИтог процессора:")
+    print("Обработано транзакций:", review_processor.get_transaction_count())
+    print("Ошибок в журнале:", len(review_processor.error_log))    
