@@ -1024,6 +1024,31 @@ class Transaction:
                 "Комиссия должна быть неотрицательным конечным числом"
             )
 
+        # Участники операции зависят от её типа:
+        # transfer — отправитель и получатель,
+        # deposit  — только получатель (деньги поступают извне),
+        # withdraw — только отправитель (деньги выдаются наружу).
+        def is_account_number(value):
+            return isinstance(value, str) and bool(value.strip())
+
+        if transaction_type == "transfer":
+            if not is_account_number(sender) or not is_account_number(receiver):
+                raise InvalidOperationError(
+                    "Для перевода нужны счёт отправителя и счёт получателя"
+                )
+
+        elif transaction_type == "deposit":
+            if sender is not None or not is_account_number(receiver):
+                raise InvalidOperationError(
+                    "Для пополнения нужен только счёт получателя (sender=None)"
+                )
+
+        elif transaction_type == "withdraw":
+            if not is_account_number(sender) or receiver is not None:
+                raise InvalidOperationError(
+                    "Для снятия нужен только счёт отправителя (receiver=None)"
+                )
+        
         self.transaction_id = str(uuid4())[:8]
         self.transaction_type = transaction_type
         self.amount = amount
@@ -1327,40 +1352,80 @@ class TransactionProcessor:
             "Владелец банковского счёта не найден"
         )
 
-    def process_transaction(self, transaction, current_hour=None):
+    def _get_account_and_owner(self, account_number, role):
+        """Находит счёт и его владельца. role — 'отправителя' / 'получателя'."""
 
-        if not isinstance(transaction, Transaction):
+        if account_number not in self.bank.accounts:
+            raise InvalidOperationError(f"Счёт {role} не найден")
+
+        account = self.bank.accounts[account_number]
+        owner = self.find_account_owner(account_number)
+
+        # Общий тип для всех счетов: BankAccount и его наследники
+        # (SavingsAccount, PremiumAccount, InvestmentAccount)
+        if not isinstance(account, BankAccount):
             raise InvalidOperationError(
-                "Передан неправильный объект транзакции"
+                f"Неподдерживаемый тип счёта {role}"
             )
 
-        if transaction.status != "pending":
-            raise InvalidOperationError(
-                "Транзакция уже обработана или отменена"
+        if account.status != "active":
+            raise InvalidOperationError(f"Счёт {role} неактивен")
+
+        return account, owner
+
+    def _apply_fee(self, transaction):
+        """Для внешних операций комиссия рассчитывается автоматически."""
+
+        if transaction.is_external:
+            transaction.fee = self.calculate_fee(
+                transaction.amount,
+                is_external=True
             )
 
-        if transaction.transaction_type != "transfer":
-            raise InvalidOperationError(
-                "Пока поддерживаются только переводы"
-            )
+        return transaction.amount + transaction.fee
 
-        if transaction.scheduled_at is not None:
-            if transaction.scheduled_at > datetime.now():
+    def _check_can_withdraw(self, account, total_amount):
+        """
+        Проверка средств до изменения балансов.
+        Правила зависят от типа счёта (полиморфное поведение из Day2).
+        """
+
+        if isinstance(account, PremiumAccount):
+
+            if total_amount > account.withdrawal_limit:
                 raise InvalidOperationError(
-                    "Время выполнения транзакции ещё не наступило"
+                    "Превышен лимит снятия премиального счёта"
                 )
 
-        if transaction.sender not in self.bank.accounts:
-            raise InvalidOperationError("Счёт отправителя не найден")
+            premium_total = total_amount + account.transaction_fee
 
-        if transaction.receiver not in self.bank.accounts:
-            raise InvalidOperationError("Счёт получателя не найден")
+            if account._balance - premium_total < -account.overdraft_limit:
+                raise InsufficientFundsError(
+                    "Превышен лимит овердрафта"
+                )
 
-        sender_account = self.bank.accounts[transaction.sender]
-        receiver_account = self.bank.accounts[transaction.receiver]
+        elif isinstance(account, SavingsAccount):
 
-        sender_client = self.find_account_owner(transaction.sender)
-        receiver_client = self.find_account_owner(transaction.receiver)
+            if account._balance - total_amount < account.min_balance:
+                raise InsufficientFundsError(
+                    "Операция нарушит минимальный остаток сберегательного счёта"
+                )
+
+        else:
+
+            if account._balance < total_amount:
+                raise InsufficientFundsError(
+                    "Недостаточно средств для операции с учётом комиссии"
+                )
+
+    def _process_transfer(self, transaction, current_hour):
+
+        sender_account, sender_client = self._get_account_and_owner(
+            transaction.sender, "отправителя"
+        )
+        receiver_account, receiver_client = self._get_account_and_owner(
+            transaction.receiver, "получателя"
+        )
 
         if transaction.sender == transaction.receiver:
             raise InvalidOperationError(
@@ -1381,55 +1446,9 @@ class TransactionProcessor:
                 receiver_account.currency
             )
 
+        total_amount = self._apply_fee(transaction)
 
-        if not isinstance(sender_account, (BankAccount, PremiumAccount)):
-            raise InvalidOperationError(
-                "Неподдерживаемый тип счёта отправителя"
-            )
-
-        if type(receiver_account) is not BankAccount:
-            raise InvalidOperationError(
-                "Пока поддерживается перевод только на обычный счёт"
-            )
-
-        if sender_account.status != "active":
-            raise InvalidOperationError(
-                "Счёт отправителя неактивен"
-            )
-
-        if receiver_account.status != "active":
-            raise InvalidOperationError(
-                "Счёт получателя неактивен"
-            )
-
-        if transaction.is_external:
-            transaction.fee = self.calculate_fee(
-                transaction.amount,
-                is_external=True
-            )
-
-        total_amount = transaction.amount + transaction.fee
-
-        if isinstance(sender_account, PremiumAccount):
-
-            premium_total = total_amount + sender_account.transaction_fee
-
-            if total_amount > sender_account.withdrawal_limit:
-                raise InvalidOperationError(
-                    "Превышен лимит снятия премиального счёта"
-                )
-
-            if sender_account._balance - premium_total < -sender_account.overdraft_limit:
-                raise InsufficientFundsError(
-                    "Превышен лимит овердрафта"
-                )
-
-        else:
-
-            if sender_account._balance < total_amount:
-                raise InsufficientFundsError(
-                    "Недостаточно средств для перевода с учётом комиссии"
-                )
+        self._check_can_withdraw(sender_account, total_amount)
 
         self.bank.check_operation_time(
             current_hour, sender_client.client_id
@@ -1462,10 +1481,92 @@ class TransactionProcessor:
             receiver_account._balance = receiver_balance_before
             raise
 
+        print("Перевод успешно выполнен")
+
+    def _process_deposit(self, transaction, current_hour):
+
+        receiver_account, receiver_client = self._get_account_and_owner(
+            transaction.receiver, "получателя"
+        )
+
+        if transaction.fee != 0 or transaction.is_external:
+            raise InvalidOperationError(
+                "Комиссия за пополнение не предусмотрена"
+            )
+
+        received_amount = transaction.amount
+
+        if receiver_account.currency != transaction.currency:
+            received_amount = self.convert_currency(
+                transaction.amount,
+                transaction.currency,
+                receiver_account.currency
+            )
+
+        self.bank.deposit(
+            receiver_client.client_id,
+            receiver_account.account_number,
+            received_amount,
+            current_hour
+        )
+
+        print("Пополнение по транзакции выполнено")
+
+    def _process_withdraw(self, transaction, current_hour):
+
+        sender_account, sender_client = self._get_account_and_owner(
+            transaction.sender, "отправителя"
+        )
+
+        if sender_account.currency != transaction.currency:
+            raise InvalidOperationError(
+                "Валюта счёта не совпадает с валютой транзакции"
+            )
+
+        total_amount = self._apply_fee(transaction)
+
+        self._check_can_withdraw(sender_account, total_amount)
+
+        self.bank.withdraw(
+            sender_client.client_id,
+            sender_account.account_number,
+            total_amount,
+            current_hour
+        )
+
+        print("Снятие по транзакции выполнено")
+
+    def process_transaction(self, transaction, current_hour=None):
+
+        if not isinstance(transaction, Transaction):
+            raise InvalidOperationError(
+                "Передан неправильный объект транзакции"
+            )
+
+        if transaction.status != "pending":
+            raise InvalidOperationError(
+                "Транзакция уже обработана или отменена"
+            )
+
+        if transaction.scheduled_at is not None:
+            if transaction.scheduled_at > datetime.now():
+                raise InvalidOperationError(
+                    "Время выполнения транзакции ещё не наступило"
+                )
+
+        # Каждому типу транзакции — свой обработчик.
+        # Новый тип операции добавляется новым методом и строкой в словаре.
+        handlers = {
+            "transfer": self._process_transfer,
+            "deposit": self._process_deposit,
+            "withdraw": self._process_withdraw
+        }
+
+        handlers[transaction.transaction_type](transaction, current_hour)
+
         transaction.complete()
         self.processed_transactions.append(transaction)
 
-        print("Перевод успешно выполнен")
         return True
 
 
