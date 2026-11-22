@@ -1,7 +1,8 @@
 from abc import ABC, abstractmethod
 from uuid import uuid4
 from math import isfinite
-from datetime import datetime
+from datetime import datetime, timedelta
+import json
 
 
 class AccountFrozenError(Exception):
@@ -17,6 +18,11 @@ class InvalidOperationError(Exception):
 
 
 class InsufficientFundsError(Exception):
+    pass
+
+
+class SuspiciousOperationError(InvalidOperationError):
+    """Операция заблокирована системой анализа рисков."""
     pass
 
 class AbstractAccount(ABC):
@@ -1568,6 +1574,225 @@ class TransactionProcessor:
         self.processed_transactions.append(transaction)
 
         return True
+
+class AuditLog:
+    """
+    Журнал аудита: хранит события в памяти и (по желанию) в файле.
+    Каждое событие — словарь с одинаковым набором полей
+    (структурное логирование), файл — по одному JSON на строку.
+    """
+
+    # Уровни важности по возрастанию
+    LEVELS = ("INFO", "WARNING", "ERROR", "CRITICAL")
+
+    def __init__(self, file_path=None, append=True):
+
+        self.entries = []
+        self.file_path = file_path
+
+        # append=False — начать файл заново (удобно для демонстрации)
+        if file_path is not None and not append:
+            with open(file_path, "w", encoding="utf-8"):
+                pass
+
+    def log(self, level, event_type, message,
+            client_id=None, transaction_id=None, details=None):
+
+        if level not in self.LEVELS:
+            raise InvalidOperationError("Недопустимый уровень важности")
+
+        if not isinstance(event_type, str) or not event_type.strip():
+            raise InvalidOperationError("Тип события должен быть непустой строкой")
+
+        entry = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "level": level,
+            "event_type": event_type,
+            "message": message,
+            "client_id": client_id,
+            "transaction_id": transaction_id,
+            "details": details or {}
+        }
+
+        self.entries.append(entry)
+
+        if self.file_path is not None:
+            with open(self.file_path, "a", encoding="utf-8") as file:
+                file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+        return entry
+
+    def filter(self, level=None, min_level=None, event_type=None,
+               client_id=None, transaction_id=None):
+
+        for value in (level, min_level):
+            if value is not None and value not in self.LEVELS:
+                raise InvalidOperationError("Недопустимый уровень важности")
+
+        results = []
+
+        for entry in self.entries:
+
+            if level is not None and entry["level"] != level:
+                continue
+
+            if min_level is not None:
+                if self.LEVELS.index(entry["level"]) < self.LEVELS.index(min_level):
+                    continue
+
+            if event_type is not None and entry["event_type"] != event_type:
+                continue
+
+            if client_id is not None and entry["client_id"] != client_id:
+                continue
+
+            if transaction_id is not None and entry["transaction_id"] != transaction_id:
+                continue
+
+            results.append(entry)
+
+        return results
+
+    def read_from_file(self):
+
+        if self.file_path is None:
+            raise InvalidOperationError("Для журнала не задан файл")
+
+        entries = []
+
+        with open(self.file_path, "r", encoding="utf-8") as file:
+            for line in file:
+                if line.strip():
+                    entries.append(json.loads(line))
+
+        return entries    
+
+
+class RiskAnalyzer:
+    """
+    Оценивает риск транзакции по набору признаков.
+    Каждый признак добавляет баллы, сумма баллов даёт уровень риска.
+    """
+
+    RISK_POINTS = {
+        "large_amount": 3,
+        "night_operation": 2,
+        "frequent_operations": 2,
+        "new_receiver": 1
+    }
+
+    FACTOR_NAMES = {
+        "large_amount": "крупная сумма",
+        "night_operation": "операция ночью",
+        "frequent_operations": "частые операции",
+        "new_receiver": "перевод на новый счёт"
+    }
+
+    def __init__(self, bank, large_amount=10000, max_operations=3,
+                 time_window_minutes=10):
+
+        for value in (large_amount, max_operations, time_window_minutes):
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise InvalidOperationError("Параметры анализатора должны быть числами")
+            if not isfinite(value) or value <= 0:
+                raise InvalidOperationError("Параметры анализатора должны быть положительными")
+
+        self.bank = bank
+        self.large_amount = large_amount          # порог в USD
+        self.max_operations = max_operations      # сколько операций допустимо в окне
+        self.time_window = timedelta(minutes=time_window_minutes)
+
+        self.operation_history = {}   # client_id -> список времени операций
+        self.known_receivers = {}     # client_id -> множество счетов-получателей
+
+    def _find_owner_id(self, account_number):
+
+        for client in self.bank.clients.values():
+            if account_number in client.account_numbers:
+                return client.client_id
+
+        raise InvalidOperationError("Владелец счёта не найден")
+
+    def get_initiator_id(self, transaction):
+        """Клиент, который совершает операцию."""
+
+        if transaction.transaction_type == "deposit":
+            return self._find_owner_id(transaction.receiver)
+
+        return self._find_owner_id(transaction.sender)
+
+    @staticmethod
+    def get_level(score):
+
+        if score >= 4:
+            return "high"
+
+        if score >= 2:
+            return "medium"
+
+        return "low"
+
+    def analyze(self, transaction, current_hour=None):
+
+        if current_hour is None:
+            current_hour = datetime.now().hour
+
+        client_id = self.get_initiator_id(transaction)
+        factors = []
+
+        # 1. Крупная сумма (сравниваем в USD)
+        amount_in_usd = CurrencyConverter.convert(
+            transaction.amount, transaction.currency, "USD"
+        )
+
+        if amount_in_usd >= self.large_amount:
+            factors.append("large_amount")
+
+        # 2. Частые операции за последние N минут
+        now = datetime.now()
+        recent = [
+            moment for moment in self.operation_history.get(client_id, [])
+            if now - moment <= self.time_window
+        ]
+
+        if len(recent) >= self.max_operations:
+            factors.append("frequent_operations")
+
+        # 3. Перевод на счёт, на который клиент ещё не переводил
+        if transaction.transaction_type == "transfer":
+
+            receiver_id = self._find_owner_id(transaction.receiver)
+            known = self.known_receivers.get(client_id, set())
+
+            # переводы между своими счетами не считаем риском
+            if receiver_id != client_id and transaction.receiver not in known:
+                factors.append("new_receiver")
+
+        # 4. Ночная операция
+        if 0 <= current_hour < 5:
+            factors.append("night_operation")
+
+        score = sum(self.RISK_POINTS[factor] for factor in factors)
+
+        return {
+            "client_id": client_id,
+            "score": score,
+            "level": self.get_level(score),
+            "factors": factors,
+            "factor_names": [self.FACTOR_NAMES[factor] for factor in factors]
+        }
+
+    def record_operation(self, transaction):
+        """Запоминает успешную операцию для будущих проверок."""
+
+        client_id = self.get_initiator_id(transaction)
+
+        self.operation_history.setdefault(client_id, []).append(datetime.now())
+
+        if transaction.transaction_type == "transfer":
+            self.known_receivers.setdefault(client_id, set()).add(
+                transaction.receiver
+            )    
 
 
 if __name__ == "__main__":
