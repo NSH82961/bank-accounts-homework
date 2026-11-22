@@ -1893,6 +1893,103 @@ class RiskAnalyzer:
                 transaction.receiver
             )    
 
+class AuditReport:
+    """Отчёты на основе журнала аудита."""
+
+    def __init__(self, audit_log, bank):
+        self.audit_log = audit_log
+        self.bank = bank
+
+    def suspicious_operations(self):
+        """Операции со средним и высоким риском."""
+
+        report = []
+
+        for entry in self.audit_log.filter(event_type="risk_assessment"):
+
+            if entry["details"]["risk_level"] == "low":
+                continue
+
+            report.append({
+                "transaction_id": entry["transaction_id"],
+                "client_id": entry["client_id"],
+                "risk_level": entry["details"]["risk_level"],
+                "factors": entry["details"]["factor_names"],
+                "blocked": entry["details"]["blocked"],
+                "timestamp": entry["timestamp"]
+            })
+
+        return report
+
+    def client_risk_profile(self, client_id):
+
+        if client_id not in self.bank.clients:
+            raise InvalidOperationError("Клиент не найден в банке")
+
+        client = self.bank.clients[client_id]
+
+        levels = {"low": 0, "medium": 0, "high": 0}
+        factors = {}
+        blocked = 0
+
+        for entry in self.audit_log.filter(
+            event_type="risk_assessment", client_id=client_id
+        ):
+            details = entry["details"]
+            levels[details["risk_level"]] += 1
+
+            if details["blocked"]:
+                blocked += 1
+
+            for name in details["factor_names"]:
+                factors[name] = factors.get(name, 0) + 1
+
+        failed = len(self.audit_log.filter(
+            event_type="transaction_failed", client_id=client_id
+        ))
+
+        bank_alerts = len([
+            activity for activity in self.bank.suspicious_activities
+            if activity["client_id"] == client_id
+        ])
+
+        if blocked > 0 or levels["high"] > 0:
+            overall = "high"
+        elif levels["medium"] > 0 or bank_alerts > 0:
+            overall = "medium"
+        else:
+            overall = "low"
+
+        return {
+            "client_id": client_id,
+            "full_name": client.full_name,
+            "overall_risk": overall,
+            "operations_by_risk": levels,
+            "blocked_operations": blocked,
+            "failed_operations": failed,
+            "risk_factors": factors,
+            "bank_alerts": bank_alerts
+        }
+
+    def error_statistics(self):
+
+        errors = self.audit_log.filter(event_type="transaction_failed")
+
+        by_type = {}
+        by_reason = {}
+
+        for entry in errors:
+            error_type = entry["details"]["error_type"]
+            by_type[error_type] = by_type.get(error_type, 0) + 1
+            by_reason[entry["message"]] = by_reason.get(entry["message"], 0) + 1
+
+        return {
+            "total_errors": len(errors),
+            "by_type": by_type,
+            "by_reason": by_reason
+        }
+
+
 
 if __name__ == "__main__":
 
@@ -4215,3 +4312,235 @@ if __name__ == "__main__":
     print("\nИтог процессора:")
     print("Обработано транзакций:", review_processor.get_transaction_count())
     print("Ошибок в журнале:", len(review_processor.error_log))    
+
+
+
+
+
+    print("\n" + "=" * 60)
+    print("DAY5: АУДИТ И РИСК-АНАЛИЗ")
+    print("=" * 60)
+
+    audit_log = AuditLog("audit_log.jsonl", append=False)
+
+    day5_bank = Bank("Day5 Bank")
+
+    risk_analyzer = RiskAnalyzer(
+        day5_bank,
+        large_amount=5000,        # крупная сумма — от 5000 USD
+        max_operations=3,         # 4-я и следующие операции ...
+        time_window_minutes=10    # ... за 10 минут — частые операции
+    )
+
+    day5_processor = TransactionProcessor(
+        day5_bank,
+        audit_log=audit_log,
+        risk_analyzer=risk_analyzer
+    )
+
+    ivan = Client("Ivan Petrov", 35, "+70000000001", "ivan@example.com")
+    maria = Client("Maria Ivanova", 29, "+70000000002", "maria@example.com")
+    oleg = Client("Oleg Sidorov", 41, "+70000000003", "oleg@example.com")
+
+    for client in (ivan, maria, oleg):
+        day5_bank.add_client(client)
+
+    ivan_account = BankAccount(owner="Ivan Petrov", balance=20000)
+    ivan_savings = SavingsAccount(owner="Ivan Petrov", balance=1000, min_balance=500)
+    maria_account = BankAccount(owner="Maria Ivanova", balance=1000)
+    oleg_account = BankAccount(owner="Oleg Sidorov", balance=50000)
+
+    day5_bank.open_account(ivan.client_id, ivan_account)
+    day5_bank.open_account(ivan.client_id, ivan_savings)
+    day5_bank.open_account(maria.client_id, maria_account)
+    day5_bank.open_account(oleg.client_id, oleg_account)
+
+
+    def run_transaction(title, transaction, hour=12):
+        """Выполняет транзакцию и печатает результат проверки риска."""
+
+        result = day5_processor.process_safely(transaction, current_hour=hour)
+
+        print(f"\n{title}")
+        print(
+            f"  Риск: {transaction.risk_level} | "
+            f"Признаки: {transaction.risk_factors or '—'}"
+        )
+        print(f"  Результат: {result} | Статус: {transaction.status}")
+
+        if transaction.failure_reason:
+            print(f"  Причина: {transaction.failure_reason}")
+
+
+    print("\n--- DAY5: ОБЫЧНЫЕ ТРАНЗАКЦИИ (Ivan) ---")
+
+    run_transaction(
+        "1. Пополнение 500 USD",
+        Transaction("deposit", 500, "USD", None, ivan_account.account_number)
+    )
+
+    run_transaction(
+        "2. Первый перевод Марии 200 USD (новый получатель)",
+        Transaction("transfer", 200, "USD",
+                    ivan_account.account_number, maria_account.account_number)
+    )
+
+    run_transaction(
+        "3. Повторный перевод Марии 300 USD (получатель уже знаком)",
+        Transaction("transfer", 300, "USD",
+                    ivan_account.account_number, maria_account.account_number)
+    )
+
+    run_transaction(
+        "4. Перевод на свой сберегательный счёт 1000 USD (4-я операция за 10 минут)",
+        Transaction("transfer", 1000, "USD",
+                    ivan_account.account_number, ivan_savings.account_number)
+    )
+
+    run_transaction(
+        "5. Снятие 100 USD (5-я операция за 10 минут)",
+        Transaction("withdraw", 100, "USD", ivan_account.account_number, None)
+    )
+
+
+    print("\n--- DAY5: ПОДОЗРИТЕЛЬНЫЕ ТРАНЗАКЦИИ (Oleg) ---")
+
+    oleg_balance_before = oleg_account._balance
+    maria_balance_before = maria_account._balance
+
+    run_transaction(
+        "6. Крупный перевод 7000 USD новому получателю",
+        Transaction("transfer", 7000, "USD",
+                    oleg_account.account_number, maria_account.account_number)
+    )
+
+    print("  Баланс Олега не изменился:", oleg_account._balance == oleg_balance_before)
+    print("  Баланс Марии не изменился:", maria_account._balance == maria_balance_before)
+
+    run_transaction(
+        "7. Крупное снятие 6000 USD",
+        Transaction("withdraw", 6000, "USD", oleg_account.account_number, None)
+    )
+
+    run_transaction(
+        "8. Пополнение 900000 RUB (= 10000 USD) на USD-счёт",
+        Transaction("deposit", 900000, "RUB", None, oleg_account.account_number)
+    )
+
+    run_transaction(
+        "9. Снятие 100 USD в 02:00",
+        Transaction("withdraw", 100, "USD", oleg_account.account_number, None),
+        hour=2
+    )
+
+    run_transaction(
+        "10. Небольшой перевод Марии 50 USD",
+        Transaction("transfer", 50, "USD",
+                    oleg_account.account_number, maria_account.account_number)
+    )
+
+    run_transaction(
+        "11. Ещё перевод Марии 50 USD (4-я операция за 10 минут)",
+        Transaction("transfer", 50, "USD",
+                    oleg_account.account_number, maria_account.account_number)
+    )
+
+    run_transaction(
+        "12. Крупный перевод 6000 USD на фоне частых операций",
+        Transaction("transfer", 6000, "USD",
+                    oleg_account.account_number, maria_account.account_number)
+    )
+
+
+    print("\n--- DAY5: ФИЛЬТРАЦИЯ ЖУРНАЛА АУДИТА ---")
+
+    print("Всего записей:", len(audit_log.entries))
+    print("Уровень WARNING:", len(audit_log.filter(level="WARNING")))
+    print("Уровень ERROR и выше:", len(audit_log.filter(min_level="ERROR")))
+    print("Уровень CRITICAL:", len(audit_log.filter(level="CRITICAL")))
+    print("Записи по Ivan:", len(audit_log.filter(client_id=ivan.client_id)))
+    print("Записи по Oleg:", len(audit_log.filter(client_id=oleg.client_id)))
+
+    print("\nВсе CRITICAL-записи:")
+
+    for entry in audit_log.filter(level="CRITICAL"):
+        print(
+            f"  {entry['timestamp']} | {entry['event_type']} | "
+            f"{entry['message']} | {entry['details']['factor_names']}"
+        )
+
+
+    print("\n--- DAY5: СОХРАНЕНИЕ В ФАЙЛ ---")
+
+    saved_entries = audit_log.read_from_file()
+
+    print("Файл:", audit_log.file_path)
+    print("Записей в файле:", len(saved_entries))
+    print("Совпадает с памятью:", saved_entries == audit_log.entries)
+    print("Первая запись:", saved_entries[0])
+
+
+    print("\n--- DAY5: ОТЧЁТ — ПОДОЗРИТЕЛЬНЫЕ ОПЕРАЦИИ ---")
+
+    audit_report = AuditReport(audit_log, day5_bank)
+
+    for item in audit_report.suspicious_operations():
+        status = "ЗАБЛОКИРОВАНА" if item["blocked"] else "пропущена с предупреждением"
+        print(
+            f"  {item['transaction_id']} | риск {item['risk_level']:6} | "
+            f"{status} | {', '.join(item['factors'])}"
+        )
+
+
+    print("\n--- DAY5: ОТЧЁТ — РИСК-ПРОФИЛЬ КЛИЕНТА ---")
+
+    for client in (ivan, oleg):
+
+        profile = audit_report.client_risk_profile(client.client_id)
+
+        print(f"\n{profile['full_name']}:")
+        print("  Общий уровень риска:", profile["overall_risk"])
+        print("  Операции по уровням риска:", profile["operations_by_risk"])
+        print("  Заблокировано операций:", profile["blocked_operations"])
+        print("  Неуспешных операций:", profile["failed_operations"])
+        print("  Признаки риска:", profile["risk_factors"])
+        print("  Сигналов в журнале банка:", profile["bank_alerts"])
+
+
+    print("\n--- DAY5: ОТЧЁТ — СТАТИСТИКА ОШИБОК ---")
+
+    statistics = audit_report.error_statistics()
+
+    print("Всего ошибок:", statistics["total_errors"])
+    print("По типу ошибки:")
+
+    for error_type, count in statistics["by_type"].items():
+        print(f"  {error_type}: {count}")
+
+    print("По причине:")
+
+    for reason, count in statistics["by_reason"].items():
+        print(f"  {count} × {reason}")
+
+
+    print("\n--- DAY5: ПРОВЕРКА НЕКОРРЕКТНЫХ ДАННЫХ ---")
+
+    try:
+        audit_log.log("DEBUG", "test", "Неизвестный уровень")
+    except InvalidOperationError as error:
+        print("AuditLog, неверный уровень:", error)
+
+    try:
+        audit_log.filter(min_level="LOW")
+    except InvalidOperationError as error:
+        print("Фильтр, неверный уровень:", error)
+
+    try:
+        RiskAnalyzer(day5_bank, large_amount=-100)
+    except InvalidOperationError as error:
+        print("RiskAnalyzer, отрицательный порог:", error)
+
+    try:
+        audit_report.client_risk_profile("unknown")
+    except InvalidOperationError as error:
+        print("Риск-профиль, неизвестный клиент:", error)
