@@ -1123,8 +1123,33 @@ class Transaction:
 
 class TransactionQueue:
 
-    def __init__(self):
+    def __init__(self, audit_log=None):
         self.transactions = []
+
+        # Day6: журнал аудита для событий очереди (необязательно)
+        self.audit_log = audit_log
+
+    def _audit(self, event_type, message, transaction):
+
+        if self.audit_log is None:
+            return
+
+        scheduled_at = None
+
+        if transaction.scheduled_at is not None:
+            scheduled_at = transaction.scheduled_at.isoformat(timespec="seconds")
+
+        self.audit_log.log(
+            "INFO", event_type, message,
+            transaction_id=transaction.transaction_id,
+            details={
+                "transaction_type": transaction.transaction_type,
+                "amount": transaction.amount,
+                "currency": transaction.currency,
+                "priority": transaction.priority,
+                "scheduled_at": scheduled_at
+            }
+        )
 
     def add_transaction(self, transaction):
 
@@ -1145,6 +1170,8 @@ class TransactionQueue:
         )
 
         print("Транзакция добавлена в очередь:", transaction.transaction_id)
+
+        self._audit("transaction_queued", "Транзакция добавлена в очередь", transaction)
 
 
     def get_ready_transactions(self):
@@ -1182,6 +1209,8 @@ class TransactionQueue:
                 transaction.completed_at = datetime.now()
 
                 print("Транзакция отменена:", transaction_id)
+                
+                self._audit("transaction_cancelled", "Транзакция отменена", transaction)
 
                 return True
 
@@ -1437,6 +1466,86 @@ class TransactionProcessor:
         raise InvalidOperationError(
             "Владелец банковского счёта не найден"
         )
+
+    def process_queue(self, queue, current_hour=None):
+        """
+        Обрабатывает все готовые транзакции очереди по приоритету.
+        Возвращает список обработанных транзакций в порядке обработки.
+        """
+
+        if not isinstance(queue, TransactionQueue):
+            raise InvalidOperationError("Передана неправильная очередь")
+
+        processed = []
+
+        for transaction in queue.get_ready_transactions():
+            self.process_safely(transaction, current_hour)
+            processed.append(transaction)
+
+        return processed
+
+    def get_client_history(self, client_id):
+        """Все обработанные транзакции по счетам клиента (успешные и нет)."""
+
+        if client_id not in self.bank.clients:
+            raise InvalidOperationError("Клиент не найден в банке")
+
+        account_numbers = set(self.bank.clients[client_id].account_numbers)
+
+        history = [
+            transaction for transaction in self.processed_transactions
+            if transaction.sender in account_numbers
+            or transaction.receiver in account_numbers
+        ]
+
+        history.sort(key=lambda transaction: transaction.created_at)
+
+        return history
+
+    def get_statistics(self):
+        """Статистика по всем обработанным транзакциям."""
+
+        by_status = {}
+        by_type = {}
+        by_risk = {}
+        volume_by_currency = {}
+        fees_by_currency = {}
+
+        for transaction in self.processed_transactions:
+
+            by_status[transaction.status] = by_status.get(transaction.status, 0) + 1
+
+            by_type[transaction.transaction_type] = (
+                by_type.get(transaction.transaction_type, 0) + 1
+            )
+
+            risk = transaction.risk_level or "not_checked"
+            by_risk[risk] = by_risk.get(risk, 0) + 1
+
+            if transaction.status == "completed":
+
+                currency = transaction.currency
+
+                volume_by_currency[currency] = (
+                    volume_by_currency.get(currency, 0) + transaction.amount
+                )
+
+                fees_by_currency[currency] = (
+                    fees_by_currency.get(currency, 0) + transaction.fee
+                )
+
+        total = len(self.processed_transactions)
+        completed = by_status.get("completed", 0)
+
+        return {
+            "total": total,
+            "by_status": by_status,
+            "by_type": by_type,
+            "by_risk": by_risk,
+            "success_rate": round(completed / total * 100, 1) if total else 0,
+            "volume_by_currency": volume_by_currency,
+            "fees_by_currency": fees_by_currency
+        }
 
     def _get_account_and_owner(self, account_number, role):
         """Находит счёт и его владельца. role — 'отправителя' / 'получателя'."""

@@ -16,4 +16,4 @@ __pycache__/
 .pytest_cache/
 
 # Audit log (generated at runtime)
-audit_log.jsonl
+*.jsonl
