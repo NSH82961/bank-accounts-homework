@@ -491,6 +491,42 @@ class Client:
         self.password = password
         self.failed_login_attempts = 0
 
+class CurrencyConverter:
+    """
+    Конвертация валют по фиксированным учебным курсам.
+    Курс показывает, сколько единиц валюты дают за 1 USD.
+    Используется и банком (итоги, рейтинг), и процессором транзакций.
+    """
+
+    EXCHANGE_RATES = {
+        "USD": 1,
+        "EUR": 0.92,
+        "RUB": 90,
+        "KZT": 450,
+        "CNY": 7.2
+    }
+
+    @classmethod
+    def convert(cls, amount, from_currency, to_currency):
+
+        if not isinstance(amount, (int, float)) or isinstance(amount, bool):
+            raise InvalidOperationError("Сумма должна быть числом")
+
+        if not isfinite(amount):
+            raise InvalidOperationError("Сумма должна быть конечным числом")
+
+        if from_currency not in cls.EXCHANGE_RATES:
+            raise InvalidOperationError("Неизвестная исходная валюта")
+
+        if to_currency not in cls.EXCHANGE_RATES:
+            raise InvalidOperationError("Неизвестная валюта получателя")
+
+        if from_currency == to_currency:
+            return amount
+
+        amount_in_usd = amount / cls.EXCHANGE_RATES[from_currency]
+
+        return amount_in_usd * cls.EXCHANGE_RATES[to_currency]
 
 class Bank:
 
@@ -808,63 +844,92 @@ class Bank:
         return results
 
 
-    def get_total_balance(self):
+    @staticmethod
+    def _get_account_total(account):
+        """Все средства счёта: свободный баланс + инвестиционный портфель."""
 
-        totals = {}
+        total = account._balance
+
+        if isinstance(account, InvestmentAccount):
+            total += sum(account.portfolio.values())
+
+        return total
+
+    @staticmethod
+    def _validate_base_currency(base_currency):
+
+        if base_currency not in CurrencyConverter.EXCHANGE_RATES:
+            raise InvalidOperationError("Недопустимая базовая валюта")
+
+    def get_total_balance(self, base_currency="USD"):
+        """
+        Возвращает:
+        - by_currency — суммы отдельно по каждой валюте (без конвертации);
+        - total — общая сумма, приведённая к базовой валюте.
+        """
+
+        self._validate_base_currency(base_currency)
+
+        by_currency = {}
+        total = 0
 
         for account in self.accounts.values():
 
+            amount = self._get_account_total(account)
             currency = account.currency
 
-            if currency not in totals:
-                totals[currency] = 0
+            by_currency[currency] = by_currency.get(currency, 0) + amount
 
-            totals[currency] += account._balance
+            total += CurrencyConverter.convert(
+                amount, currency, base_currency
+            )
 
-            if isinstance(account, InvestmentAccount):
-                totals[currency] += sum(account.portfolio.values())
+        return {
+            "base_currency": base_currency,
+            "by_currency": by_currency,
+            "total": round(total, 2)
+        }
 
-        return totals
 
+    def get_clients_ranking(self, base_currency="USD"):
+        """
+        Единый рейтинг клиентов: средства всех счетов клиента
+        переводятся в базовую валюту, затем клиенты сортируются.
+        """
 
-    def get_clients_ranking(self):
+        self._validate_base_currency(base_currency)
 
-        ranking = {}
+        ranking = []
 
         for client in self.clients.values():
 
-            totals = {}
+            by_currency = {}
+            total = 0
 
             for account_number in client.account_numbers:
 
                 account = self.accounts[account_number]
+                amount = self._get_account_total(account)
                 currency = account.currency
 
-                if currency not in totals:
-                    totals[currency] = 0
+                by_currency[currency] = by_currency.get(currency, 0) + amount
 
-                totals[currency] += account._balance
+                total += CurrencyConverter.convert(
+                    amount, currency, base_currency
+                )
 
-                if isinstance(account, InvestmentAccount):
-                    totals[currency] += sum(account.portfolio.values())
+            ranking.append({
+                "client_id": client.client_id,
+                "full_name": client.full_name,
+                "total_balance": round(total, 2),
+                "base_currency": base_currency,
+                "balances_by_currency": by_currency
+            })
 
-            for currency, total in totals.items():
-
-                if currency not in ranking:
-                    ranking[currency] = []
-
-                ranking[currency].append({
-                    "client_id": client.client_id,
-                    "full_name": client.full_name,
-                    "total_balance": total
-                })
-
-        for currency in ranking:
-
-            ranking[currency].sort(
-                key=lambda client: client["total_balance"],
-                reverse=True
-            )
+        ranking.sort(
+            key=lambda item: item["total_balance"],
+            reverse=True
+        )
 
         return ranking
 
@@ -1118,14 +1183,6 @@ class TransactionProcessor:
 
     def convert_currency(self, amount, from_currency, to_currency):
 
-        exchange_rates = {
-            "USD": 1,
-            "EUR": 0.92,
-            "RUB": 90,
-            "KZT": 450,
-            "CNY": 7.2
-        }
-
         if not isinstance(amount, (int, float)) or isinstance(amount, bool):
             raise InvalidOperationError(
                 "Сумма должна быть числом"
@@ -1136,19 +1193,9 @@ class TransactionProcessor:
                 "Сумма должна быть положительным конечным числом"
             )
 
-        if from_currency not in exchange_rates:
-            raise InvalidOperationError(
-                "Неизвестная исходная валюта"
-            )
-
-        if to_currency not in exchange_rates:
-            raise InvalidOperationError(
-                "Неизвестная валюта получателя"
-            )
-
-        amount_in_usd = amount / exchange_rates[from_currency]
-
-        converted_amount = amount_in_usd * exchange_rates[to_currency]
+        converted_amount = CurrencyConverter.convert(
+            amount, from_currency, to_currency
+        )
 
         return round(converted_amount, 2)
 
@@ -2246,27 +2293,28 @@ if __name__ == "__main__":
 
     print("\n--- DAY3: ОБЩИЙ БАЛАНС БАНКА ---")
 
-    total_balance = bank.get_total_balance()
+    total_balance = bank.get_total_balance("USD")
 
-    for currency, amount in total_balance.items():
-        print(f"Общий баланс в {currency}: {amount:.2f}")
+    for currency, amount in total_balance["by_currency"].items():
+        print(f"Сумма в {currency}: {amount:.2f}")
+
+    print(
+        f"Итого в базовой валюте: "
+        f"{total_balance['total']:.2f} {total_balance['base_currency']}"
+    )
 
 
 
     print("\n--- DAY3: РЕЙТИНГ КЛИЕНТОВ ---")
 
-    ranking = bank.get_clients_ranking()
+    ranking = bank.get_clients_ranking("USD")
 
-    for currency, clients in ranking.items():
+    for position, client in enumerate(ranking, start=1):
 
-        print(f"\nРейтинг клиентов в {currency}:")
-
-        for position, client in enumerate(clients, start=1):
-
-            print(
-                f"{position}. {client['full_name']} — "
-                f"{client['total_balance']:.2f} {currency}"
-            )
+        print(
+            f"{position}. {client['full_name']} — "
+            f"{client['total_balance']:.2f} {client['base_currency']}"
+        )
 
 
     print("\n--- DAY3: ПРОВЕРКА ОШИБОК ПОИСКА ---")
@@ -3194,14 +3242,21 @@ if __name__ == "__main__":
     currency_bank.open_account(client_kzt.client_id, account_kzt)
     currency_bank.open_account(client_cny.client_id, account_cny)
 
-    print("Общий баланс:", currency_bank.get_total_balance())
+    total_balance = currency_bank.get_total_balance("USD")
 
-    ranking = currency_bank.get_clients_ranking()
+    print("Суммы по валютам:", total_balance["by_currency"])
+    print("Итого:", total_balance["total"], total_balance["base_currency"])
 
-    for currency, clients in ranking.items():
-        print(f"\nРейтинг в {currency}:")
-        for client in clients:
-            print(client["full_name"], client["total_balance"])
+    print("\nЕдиный рейтинг в USD:")
+
+    for position, client in enumerate(
+        currency_bank.get_clients_ranking("USD"), start=1
+    ):
+        print(
+            f"{position}. {client['full_name']} — "
+            f"{client['total_balance']:.2f} USD "
+            f"(на счетах: {client['balances_by_currency']})"
+        )
 
 
 
