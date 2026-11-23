@@ -17,3 +17,6 @@ __pycache__/
 
 # Audit log (generated at runtime)
 *.jsonl
+
+# Generated reports and charts
+reports/
