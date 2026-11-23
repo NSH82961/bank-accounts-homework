@@ -1228,6 +1228,40 @@ class TransactionProcessor:
         # Day5: журнал аудита и анализатор рисков подключаются по желанию
         self.audit_log = audit_log
         self.risk_analyzer = risk_analyzer
+        
+        # Day7: история балансов счетов для графиков
+        # номер счёта -> список {"step", "transaction_id", "balance"}
+        self.balance_history = {}
+
+    def _snapshot_balances(self, transaction, initial=False):
+        """
+        Запоминает балансы счетов, участвующих в транзакции.
+        initial=True — только начальная точка для счёта, которого ещё нет в истории.
+        """
+
+        for account_number in (transaction.sender, transaction.receiver):
+
+            if account_number is None or account_number not in self.bank.accounts:
+                continue
+
+            history = self.balance_history.setdefault(account_number, [])
+
+            if initial and history:
+                continue
+
+            history.append({
+                "step": len(history),
+                "transaction_id": None if initial else transaction.transaction_id,
+                "balance": self.bank.accounts[account_number]._balance
+            })
+
+    def get_balance_history(self, account_number):
+        """История баланса счёта (копия списка)."""
+
+        if account_number not in self.bank.accounts:
+            raise InvalidOperationError("Счёт не найден в банке")
+
+        return list(self.balance_history.get(account_number, []))
 
     def _audit(self, level, event_type, message, transaction, details=None):
         """Пишет событие в журнал аудита, если он подключён."""
@@ -1760,10 +1794,14 @@ class TransactionProcessor:
         if self.risk_analyzer is not None:
             self._assess_risk(transaction, current_hour)
 
+        self._snapshot_balances(transaction, initial=True)     
+
         handlers[transaction.transaction_type](transaction, current_hour)
 
         transaction.complete()
         self.processed_transactions.append(transaction)
+
+        self._snapshot_balances(transaction)
 
         if self.risk_analyzer is not None:
             self.risk_analyzer.record_operation(transaction)
